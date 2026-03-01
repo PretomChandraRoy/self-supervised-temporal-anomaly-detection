@@ -78,8 +78,8 @@ Input Time-Series (OHLC + Technical Indicators)
 
 ```
 anomaly_detection/
-├── train_improved_full.py          # Main training & evaluation pipeline
-├── generate_detailed_excel.py      # Excel report generator (9-sheet report)
+├── train.py                        # Main training & evaluation pipeline
+├── report_generator.py             # Excel report generator (9-sheet report)
 ├── requirements.txt                # Python dependencies
 ├── __init__.py
 │
@@ -119,7 +119,7 @@ pip install -r requirements.txt
 ### 2. Run Training
 
 ```bash
-python train_improved_full.py
+python train.py
 ```
 
 This single command runs the complete pipeline:
@@ -160,7 +160,7 @@ improved_outputs_YYYYMMDD_HHMMSS/
 
 ## Configuration
 
-Key hyperparameters can be modified in the `ImprovedConfig` class inside `train_improved_full.py`:
+Key hyperparameters can be modified in the `ImprovedConfig` class inside `train.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
