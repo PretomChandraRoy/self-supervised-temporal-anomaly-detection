@@ -1,338 +1,221 @@
-# Self-Supervised Temporal Anomaly Detection Framework
+# Self-Supervised Temporal Anomaly Detection in Financial Time-Series
 
-## 📋 Overview
+A PyTorch implementation of self-supervised temporal representation learning for anomaly detection in financial time-series data. Developed as part of a thesis project on detecting abnormal market behavior using transformer-based encoders, contrastive learning, and energy-based scoring.
 
-A comprehensive self-supervised learning framework for detecting anomalies in financial time-series data. This implementation is based on the research paper abstract focusing on **temporal representation learning, contrastive learning, masked reconstruction, and energy-based anomaly scoring**.
+---
 
-## 🎯 Key Features
+## Overview
 
-### 1. **Transformer-Based Temporal Encoder**
-- Multi-head self-attention mechanism
-- Positional encoding for temporal sequences
-- Captures long-range dependencies in market behavior
-- Context-aware embeddings for regime transitions
+This framework learns normal market behavior patterns from unlabeled forex data using self-supervised objectives, then detects anomalies as deviations from those learned patterns. The system combines three complementary detection strategies in a hybrid fusion approach.
 
-### 2. **Self-Supervised Learning Objectives**
-- **Temporal Contrastive Learning**: NT-Xent loss with temporal augmentations
-- **Masked Time-Series Reconstruction**: Autoencoder-style reconstruction loss
-- Combined multi-task learning approach
+### Key Components
 
-### 3. **Density-Aware Clustering**
-- Discovers normal market regimes automatically
-- Supports K-Means, GMM, and DBSCAN
-- Density-based filtering for regime identification
-- Latent space regularization for better separation
+| Component | Description |
+|-----------|-------------|
+| **Temporal Transformer Encoder** | Multi-head self-attention with positional encoding for capturing long-range dependencies |
+| **Self-Supervised Learning** | Temporal contrastive learning (NT-Xent) + masked time-series reconstruction |
+| **Density-Aware Clustering** | Automatic discovery of normal market regimes via K-Means with density filtering |
+| **Energy-Based Scoring** | Cluster-conditioned energy functions that assign high energy to out-of-distribution samples |
+| **Reconstruction-Based Detection** | Reconstruction error measurement for identifying anomalous patterns |
+| **Hybrid Fusion** | Weighted combination of reconstruction, cluster, and energy scores with adaptive thresholding |
 
-### 4. **Hybrid Anomaly Detection**
-- **Energy-Based Scoring**: Cluster-conditioned energy functions
-- **Reconstruction-Based Detection**: Mahalanobis distance measures
-- Score fusion (weighted sum, max, product)
-- Adaptive threshold determination
+---
 
-### 5. **Financial Time-Series Processing**
-- Automatic technical indicator generation (30+ features)
-- Robust scaling and preprocessing
-- Sliding window sequence generation
-- Compatible with OHLC forex data
-
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   Input Time-Series (OHLC)                  │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│         Technical Indicator Generation & Scaling             │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Transformer Temporal Encoder                    │
-│  • Positional Encoding                                       │
-│  • Multi-Head Self-Attention (4 layers)                      │
-│  • Feed-Forward Networks                                     │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-            ┌────────────┴────────────┐
-            ▼                         ▼
-┌───────────────────────┐  ┌──────────────────────────┐
-│  Contrastive Learning │  │ Masked Reconstruction    │
-│  • Temporal Augment   │  │ • Random Masking         │
-│  • NT-Xent Loss       │  │ • MSE Reconstruction     │
-└───────────────────────┘  └──────────────────────────┘
-            │                         │
-            └────────────┬────────────┘
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Learned Embeddings                          │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│            Density-Aware Clustering                          │
-│  • K-Means / GMM / DBSCAN                                    │
-│  • Normal Regime Identification                              │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-            ┌────────────┴────────────┐
-            ▼                         ▼
-┌───────────────────────┐  ┌──────────────────────────┐
-│  Energy-Based Scoring │  │ Reconstruction Error     │
-│  • Cluster-Conditioned│  │ • Mahalanobis Distance   │
-│  • Learned Energy Fn  │  │ • Deviation Measures     │
-└───────────────────────┘  └──────────────────────────┘
-            │                         │
-            └────────────┬────────────┘
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Hybrid Anomaly Scores                           │
-│  • Score Fusion                                              │
-│  • Adaptive Thresholding                                     │
-└────────────────────────┬────────────────────────────────────┘
-                         ▼
-            🚨 Detected Anomalies 🚨
+Input Time-Series (OHLC + Technical Indicators)
+        │
+        ▼
+┌──────────────────────────────────────┐
+│  Financial Data Preprocessing        │
+│  • Technical indicators (25 features)│
+│  • Robust scaling & outlier clipping │
+│  • Sliding window sequences (60-step)│
+└──────────────┬───────────────────────┘
+               ▼
+┌──────────────────────────────────────┐
+│  Transformer Temporal Encoder        │
+│  • Positional encoding               │
+│  • Multi-head self-attention (5 layers, 8 heads) │
+│  • Feed-forward networks             │
+└──────────────┬───────────────────────┘
+               │
+       ┌───────┴───────┐
+       ▼               ▼
+┌─────────────┐ ┌──────────────┐
+│ Contrastive │ │   Masked     │
+│  Learning   │ │Reconstruction│
+│ (NT-Xent)   │ │   (MSE)      │
+└──────┬──────┘ └──────┬───────┘
+       └───────┬───────┘
+               ▼
+┌──────────────────────────────────────┐
+│  Learned Temporal Embeddings         │
+└──────────────┬───────────────────────┘
+               │
+       ┌───────┼───────────┐
+       ▼       ▼           ▼
+┌──────────┐ ┌──────────┐ ┌──────────────┐
+│Density-  │ │Energy-   │ │Reconstruction│
+│Aware     │ │Based     │ │Error         │
+│Clustering│ │Scoring   │ │Detection     │
+└────┬─────┘ └────┬─────┘ └──────┬───────┘
+     └─────────┬──┴──────────────┘
+               ▼
+┌──────────────────────────────────────┐
+│  Hybrid Anomaly Score Fusion         │
+│  • Weighted sum + max aggregation    │
+│  • Validation-based threshold tuning │
+└──────────────┬───────────────────────┘
+               ▼
+        Detected Anomalies
 ```
 
-## 📁 Project Structure
+---
+
+## Project Structure
 
 ```
 anomaly_detection/
+├── train_improved_full.py          # Main training & evaluation pipeline
+├── generate_detailed_excel.py      # Excel report generator (9-sheet report)
+├── requirements.txt                # Python dependencies
+├── __init__.py
+│
 ├── models/
-│   ├── temporal_transformer.py    # Transformer encoder & SSL objectives
+│   ├── temporal_transformer.py     # Transformer encoder & SSL objectives
 │   ├── clustering.py               # Density-aware clustering
 │   └── anomaly_detector.py         # Energy & reconstruction detectors
-├── training/
-│   └── trainer.py                  # Training pipeline
+│
 ├── data/
-│   └── preprocessing.py            # Data loading & preprocessing
-├── utils/
-│   ├── visualization.py            # Plotting functions
-│   └── evaluation.py               # Metrics & evaluation
-├── main.py                         # Main execution script
-├── requirements.txt
-└── README.md
+│   ├── preprocessing.py            # Data loading, feature engineering, scaling
+│   └── H4_EURUSD_2015.csv         # EUR/USD H4 forex dataset (2015-2024)
+│
+├── training/
+│   └── trainer.py                  # Training pipeline utilities
+│
+├── validation/
+│   └── synthetic_anomalies.py      # Synthetic anomaly injection for evaluation
+│
+└── utils/
+    ├── evaluation.py               # Metrics & evaluation functions
+    └── visualization.py            # Plotting utilities
 ```
 
-## 🚀 Quick Start
+---
 
-### Installation
+## Quick Start
+
+### 1. Install Dependencies
 
 ```bash
 cd anomaly_detection
 pip install -r requirements.txt
 ```
 
-### Option 1: Quick Training & Testing (Recommended for First Time)
+**Requirements:** Python 3.10+, PyTorch 2.6.0, NumPy, pandas, scikit-learn, matplotlib, seaborn
 
-**Train the anomaly detector:**
-```bash
-python train_anomaly_detector.py
-```
-
-This simplified script will:
-- Load EURUSD H4 data
-- Train for 10 epochs (fast demo)
-- Test on validation set
-- Save model to `example_outputs/checkpoints/`
-
-**Validate with synthetic anomalies:**
-```bash
-python validate_anomaly_detector.py
-```
-
-This will:
-- Inject synthetic anomalies
-- Test detection performance
-- Show precision, recall, F1 score
-- Save report to `validation_outputs/`
-
-**Test reconstruction-only detection:**
-```bash
-python test_reconstruction_only.py
-```
-
-### Option 2: Full Training with Custom Parameters
-
-**1. Train the Model**
+### 2. Run Training
 
 ```bash
-python main.py \
-    --data_path ../forexPredictor/H4_EURUSD_2015.csv \
-    --window_size 60 \
-    --n_epochs 100 \
-    --batch_size 32 \
-    --n_clusters 10 \
-    --mode train
+python train_improved_full.py
 ```
 
-**2. Test on New Data**
+This single command runs the complete pipeline:
+1. Loads and preprocesses EUR/USD H4 forex data
+2. Injects synthetic anomalies for supervised evaluation
+3. Trains the transformer encoder with contrastive + reconstruction objectives
+4. Performs density-aware clustering on learned embeddings
+5. Trains the energy-based anomaly detector
+6. Tunes detection threshold on validation set
+7. Evaluates on held-out test set
+8. Generates thesis-ready visualizations and Excel report
 
-```bash
-python main.py \
-    --data_path ../forexPredictor/H4_EURUSD_2015.csv \
-    --checkpoint outputs/checkpoints/final_model.pt \
-    --mode test
+### 3. View Results
+
+After training completes, results are saved in a timestamped folder:
+
 ```
-
-**3. Full Pipeline (Train + Test)**
-
-```bash
-python main.py \
-    --data_path ../forexPredictor/H4_EURUSD_2015.csv \
-    --window_size 60 \
-    --n_epochs 100 \
-    --mode full
+improved_outputs_YYYYMMDD_HHMMSS/
+├── checkpoints/
+│   └── best_model.pt              # Best model weights
+├── config.json                     # Training configuration
+├── results.json                    # All metrics (JSON)
+├── predictions.csv                 # Per-sample predictions
+├── training_curves.png             # Loss curves
+├── final_model.pt                  # Final model + detectors
+├── DETAILED_RESULTS.xlsx           # 9-sheet Excel report
+└── thesis_figures/                 # Publication-ready figures (300 DPI)
+    ├── 1_training_curves.png
+    ├── 2_confusion_matrix.png
+    ├── 3_performance_metrics.png
+    ├── 4_anomaly_score_distribution.png
+    ├── 5_precision_recall_curve.png
+    ├── 6_detection_timeline.png
+    └── 7_results_dashboard.png
 ```
-
-## 📊 Command Line Arguments
-
-### Data Parameters
-- `--data_path`: Path to CSV file with OHLC data (required)
-- `--window_size`: Sequence length (default: 60)
-- `--stride`: Sliding window stride (default: 1)
-- `--train_ratio`: Train/test split ratio (default: 0.8)
-
-### Model Parameters
-- `--d_model`: Transformer dimension (default: 128)
-- `--n_heads`: Attention heads (default: 8)
-- `--n_layers`: Transformer layers (default: 4)
-- `--dropout`: Dropout rate (default: 0.1)
-
-### Training Parameters
-- `--n_epochs`: Training epochs (default: 100)
-- `--batch_size`: Batch size (default: 32)
-- `--learning_rate`: Learning rate (default: 1e-4)
-- `--contrastive_weight`: Contrastive loss weight (default: 1.0)
-- `--reconstruction_weight`: Reconstruction loss weight (default: 1.0)
-
-### Clustering Parameters
-- `--n_clusters`: Number of clusters (default: 10)
-- `--clustering_method`: kmeans/gmm/dbscan (default: kmeans)
-
-### Anomaly Detection Parameters
-- `--anomaly_threshold_percentile`: Threshold percentile (default: 95)
-- `--fusion_method`: weighted_sum/max/product (default: weighted_sum)
-
-## 📈 Output
-
-The framework generates:
-
-1. **Checkpoints**: Trained model weights
-   - `outputs/checkpoints/best_model.pt`
-   - `outputs/checkpoints/final_model.pt`
-
-2. **Visualizations**:
-   - Training history curves
-   - Embedding visualizations (t-SNE)
-   - Anomaly score distributions
-   - Detected anomalies on price charts
-
-3. **Results**:
-   - `outputs/anomaly_results.csv`: Anomaly scores and labels
-   - Statistics and metrics
-
-## 🔬 Technical Details
-
-### Temporal Contrastive Learning
-- Creates augmented views through temporal masking and noise injection
-- Uses InfoNCE loss (NT-Xent) with temperature scaling
-- Learns invariant representations across augmentations
-
-### Masked Reconstruction
-- Randomly masks 15% of time steps
-- Reconstructs masked segments using transformer encoder
-- Learns to capture temporal dependencies
-
-### Energy-Based Detection
-- Trains energy function to assign low energy to normal samples
-- Cluster-conditioned normalization for better calibration
-- High energy indicates out-of-distribution samples
-
-### Reconstruction-Based Detection
-- Computes reconstruction error using Mahalanobis distance
-- Fits distribution on normal training data
-- Large deviations indicate anomalies
-
-## 📊 Evaluation Metrics
-
-- **Anomaly Statistics**: Count, rate, score distribution
-- **Clustering Quality**: Silhouette score, density distribution
-- **Detection Performance**: Precision, recall, F1, AUROC (if labels available)
-- **Financial Impact**: Returns, Sharpe ratio, win rate
-
-## 🎯 Use Cases
-
-1. **Abnormal Price Movements**: Flash crashes, sudden spikes
-2. **Volatility Spikes**: Market regime changes
-3. **Market Microstructure Anomalies**: Unusual trading patterns
-4. **Risk Management**: Early warning system
-5. **Trading Strategy**: Anomaly-based signal generation
-
-## 🔧 Customization
-
-### Add Custom Technical Indicators
-
-Edit `data/preprocessing.py`:
-
-```python
-def add_features(self, df):
-    # Add your custom indicators
-    df['custom_indicator'] = ...
-    return df
-```
-
-### Modify Transformer Architecture
-
-Edit `models/temporal_transformer.py`:
-
-```python
-class TemporalTransformerEncoder(nn.Module):
-    def __init__(self, ...):
-        # Customize layers, dimensions, etc.
-        ...
-```
-
-### Implement New Anomaly Scoring
-
-Edit `models/anomaly_detector.py`:
-
-```python
-class CustomAnomalyDetector:
-    def compute_score(self, embeddings):
-        # Your scoring logic
-        ...
-```
-
-## 📚 References
-
-This implementation is based on concepts from:
-
-- **Transformers**: "Attention is All You Need" (Vaswani et al., 2017)
-- **Contrastive Learning**: "A Simple Framework for Contrastive Learning" (Chen et al., 2020)
-- **Masked Autoencoders**: "Masked Autoencoders Are Scalable Vision Learners" (He et al., 2021)
-- **Energy-Based Models**: "Your Classifier is Secretly an Energy Based Model" (Grathwohl et al., 2019)
-
-## ⚠️ Disclaimer
-
-This framework is for **research and educational purposes only**. Detected anomalies should be validated before making trading decisions. No financial advice is provided.
-
-## 🤝 Contributing
-
-Contributions are welcome! Areas for improvement:
-- Additional SSL objectives (MoCo, BYOL, SwAV)
-- More sophisticated clustering algorithms
-- Online/streaming anomaly detection
-- Multi-scale temporal modeling
-- Integration with existing trading systems
-
-## 📝 License
-
-Same as parent project - Educational use only.
 
 ---
 
-**Author**: Implementation based on research abstract for thesis project
-**Framework**: PyTorch-based self-supervised learning for financial anomaly detection
+## Configuration
 
+Key hyperparameters can be modified in the `ImprovedConfig` class inside `train_improved_full.py`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `D_MODEL` | 192 | Transformer embedding dimension |
+| `N_HEADS` | 8 | Number of attention heads |
+| `N_LAYERS` | 5 | Number of transformer layers |
+| `N_EPOCHS` | 150 | Maximum training epochs |
+| `BATCH_SIZE` | 64 | Training batch size |
+| `LEARNING_RATE` | 1e-4 | AdamW learning rate |
+| `WINDOW_SIZE` | 60 | Input sequence length (time steps) |
+| `N_CLUSTERS` | 8 | Number of market regime clusters |
+| `ANOMALY_RATIO` | 0.07 | Fraction of synthetic anomalies injected |
+| `RECON_WEIGHT` | 0.45 | Reconstruction score weight in hybrid fusion |
+| `ENERGY_WEIGHT` | 0.30 | Energy score weight in hybrid fusion |
+| `CLUSTER_WEIGHT` | 0.25 | Cluster score weight in hybrid fusion |
+
+---
+
+## Dataset
+
+**EUR/USD H4 (4-hour) candlestick data** from 2015 to 2024, containing 14,566 rows with OHLC prices, tick volume, spread, and real volume. The preprocessing pipeline automatically generates 25 features including returns, moving averages, Bollinger Bands, RSI, MACD, and other technical indicators.
+
+---
+
+## Technical Details
+
+### Self-Supervised Learning Objectives
+
+- **Temporal Contrastive Learning**: Creates augmented views through temporal masking and noise injection. Uses NT-Xent (InfoNCE) loss with temperature scaling to learn invariant representations.
+- **Masked Reconstruction**: Randomly masks time steps and reconstructs them using the transformer encoder. MSE loss captures temporal dependencies.
+
+### Anomaly Detection Pipeline
+
+- **Energy-Based Detection**: Trains a neural energy function conditioned on cluster assignments. Normal samples receive low energy; anomalies receive high energy via contrastive margin loss.
+- **Reconstruction-Based Detection**: Computes per-sample reconstruction error. Anomalies that deviate from learned normal patterns produce higher reconstruction loss.
+- **Hybrid Fusion**: Combines normalized scores from all three components (reconstruction, cluster distance, energy) using a weighted sum + max aggregation strategy.
+
+### Threshold Tuning
+
+Multi-stage search on the validation set:
+1. Wide search over percentile-based thresholds (70th–99.9th)
+2. Fine-grained refinement around best candidate
+3. Precision-constrained optimization (minimum 30% precision)
+
+---
+
+## References
+
+- Vaswani et al., "Attention is All You Need" (2017)
+- Chen et al., "A Simple Framework for Contrastive Learning of Visual Representations" (2020)
+- He et al., "Masked Autoencoders Are Scalable Vision Learners" (2021)
+- Grathwohl et al., "Your Classifier is Secretly an Energy Based Model" (2019)
+
+---
+
+## License
+
+Educational and research use only.

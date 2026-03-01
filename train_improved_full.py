@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.temporal_transformer import SelfSupervisedTemporalModel
-from models.clusteri    ng import DensityAwareClustering
+from models.clustering import DensityAwareClustering
 from models.anomaly_detector import (
     EnergyBasedAnomalyDetector,
     ReconstructionBasedDetector,

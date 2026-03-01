@@ -1,30 +1,30 @@
 # Python cache
 __pycache__/
 *.pyc
+*.pyo
 
 # Virtual environments
 .venv/
 venv/
+env/
 
-# Model weights
+# Model weights (generated during training)
 *.pt
 *.pth
 *.h5
 
-# Excel / CSV outputs
-*.xlsx
-*.csv
-
-# Generated outputs
+# Generated outputs (each run creates a timestamped folder)
 improved_outputs_*/
-example_outputs/
-working_outputs/
-validation_outputs/
-quick_test_outputs/
-final_outputs/
 
 # IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# Large dataset
-data/*.csv
+# OS files
+Thumbs.db
+.DS_Store
+
+# Backup
+anomaly_detection_backup.zip
