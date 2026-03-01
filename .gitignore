@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Model weights
+*.pt
+*.pth
+*.h5
+
+# Excel / CSV outputs
+*.xlsx
+*.csv
+
+# Generated outputs
+improved_outputs_*/
+example_outputs/
+working_outputs/
+validation_outputs/
+quick_test_outputs/
+final_outputs/
+
+# IDE
+.idea/
+
+# Large dataset
+data/*.csv
