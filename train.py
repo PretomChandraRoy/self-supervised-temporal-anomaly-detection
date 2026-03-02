@@ -214,13 +214,23 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
     return data_modified, anomaly_mask
 
 
-def train_energy_detector_stable(energy_detector, train_loader, embedder, cluster_labels_full, config):
+def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedder, config):
     """
-    Train energy detector with NaN protection
+    Train energy detector using ACTUAL ground truth labels (not cluster labels).
+    Uses a dedicated non-shuffled DataLoader to keep label alignment correct.
     """
     print("\n" + "="*60)
-    print("Training Stable Energy Detector")
+    print("Training Stable Energy Detector (Supervised with Ground Truth)")
     print("="*60)
+
+    # Create a DataLoader that includes ground truth labels to avoid shuffle misalignment
+    gt_tensor = torch.FloatTensor(train_gt.astype(np.float32))
+    energy_dataset = TensorDataset(train_tensor, gt_tensor)
+    energy_loader = DataLoader(energy_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+
+    n_anomalies = train_gt.sum()
+    n_normal = len(train_gt) - n_anomalies
+    print(f"  Training samples: {n_normal} normal, {n_anomalies} anomalous ({n_anomalies/len(train_gt)*100:.1f}%)")
 
     optimizer = optim.AdamW(
         energy_detector.parameters(),
@@ -237,52 +247,56 @@ def train_energy_detector_stable(energy_detector, train_loader, embedder, cluste
     for epoch in range(config.ENERGY_EPOCHS):
         epoch_losses = []
 
-        for batch_idx, (x,) in enumerate(train_loader):
+        for x, labels in energy_loader:
             x = x.to(config.DEVICE)
-            batch_start = batch_idx * config.BATCH_SIZE
-            batch_end = min(batch_start + len(x), len(cluster_labels_full))
-            batch_clusters = cluster_labels_full[batch_start:batch_end]
+            labels = labels.to(config.DEVICE)
 
-            # Get embeddings
+            # Get embeddings from frozen encoder
             with torch.no_grad():
                 embeddings = embedder.get_embeddings(x)
 
-            # Compute energy
-            energies = energy_detector(embeddings, batch_clusters)
+            # Compute raw energy (no cluster normalization during training)
+            energies = energy_detector.compute_energy(embeddings)
 
-            # STABLE LOSS: Contrastive energy with numerical stability
-            normal_mask = batch_clusters < config.N_CLUSTERS - 1
+            # Use actual ground truth: normal (0) vs anomaly (1)
+            is_anomaly = labels.bool()
+            is_normal = ~is_anomaly
 
-            if normal_mask.sum() > 0 and (~normal_mask).sum() > 0:
-                # Push normal samples to low energy
-                normal_energy = energies[normal_mask]
-                # Push outlier cluster to high energy
-                outlier_energy = energies[~normal_mask]
+            if is_normal.sum() > 0 and is_anomaly.sum() > 0:
+                normal_energy = energies[is_normal]
+                anomaly_energy = energies[is_anomaly]
 
-                # Clamp to prevent overflow
+                # Clamp for numerical stability
                 normal_energy = torch.clamp(normal_energy, -10, 10)
-                outlier_energy = torch.clamp(outlier_energy, -10, 10)
+                anomaly_energy = torch.clamp(anomaly_energy, -10, 10)
 
-                # IMPROVED: Stronger margin loss with explicit separation
-                margin = 2.0  # Larger margin for better separation
-                margin_loss = torch.relu(margin + normal_energy.mean() - outlier_energy.mean())
+                # Margin loss: anomaly energy should be at least `margin` higher than normal
+                margin = 3.0
+                margin_loss = torch.relu(margin + normal_energy.mean() - anomaly_energy.mean())
 
-                # Explicitly push normal energies DOWN and outlier energies UP
-                normal_push = torch.relu(normal_energy + 0.5).mean()  # Push below -0.5
-                outlier_push = torch.relu(1.5 - outlier_energy).mean()  # Push above 1.5
+                # Push normal energies low, anomaly energies high
+                normal_push = torch.relu(normal_energy - 0.0).mean()   # Push below 0
+                anomaly_push = torch.relu(2.0 - anomaly_energy).mean()  # Push above 2
+
+                # Binary cross-entropy style: sigmoid of energy as anomaly probability
+                anomaly_prob = torch.sigmoid(energies)
+                bce_loss = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='mean')
 
                 # L2 regularization
-                reg_loss = 0.01 * (normal_energy ** 2).mean()
+                reg_loss = 0.001 * (energies ** 2).mean()
 
-                loss = margin_loss + 0.5 * normal_push + 0.5 * outlier_push + reg_loss
+                loss = margin_loss + 0.3 * normal_push + 0.3 * anomaly_push + 0.5 * bce_loss + reg_loss
+            elif is_normal.sum() > 0:
+                # Only normal samples in this batch
+                loss = torch.relu(energies[is_normal]).mean() + 0.001 * (energies ** 2).mean()
             else:
-                # Fallback: just minimize variance
-                loss = 0.1 * energies.var() + 0.01 * (energies ** 2).mean()
+                # Only anomaly samples (rare)
+                loss = torch.relu(2.0 - energies[is_anomaly]).mean() + 0.001 * (energies ** 2).mean()
 
             # Check for NaN
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_count += 1
-                if nan_count > 5:
+                if nan_count > 10:
                     print(f"⚠️  Too many NaN/Inf, stopping energy training at epoch {epoch+1}")
                     return False
                 continue
@@ -515,7 +529,21 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     print(f"✓ Best threshold: {best_threshold:.4f}")
     print(f"  Val F1: {best_metrics['f1']:.3f}, Precision: {best_metrics['precision']:.3f}, Recall: {best_metrics['recall']:.3f}")
 
-    return best_threshold, best_metrics, combined_scores
+    # Store normalization statistics for reuse on test set
+    norm_stats = {}
+    if config.USE_HYBRID and energy_detector is not None:
+        norm_stats = {
+            'recon_p5': recon_p5, 'recon_p95': recon_p95,
+            'energy_p5': energy_p5, 'energy_p95': energy_p95,
+            'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
+        }
+    else:
+        norm_stats = {
+            'recon_p5': recon_p5, 'recon_p95': recon_p95,
+            'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
+        }
+
+    return best_threshold, best_metrics, combined_scores, norm_stats
 
 
 def save_training_plots(train_losses, val_losses, output_dir):
@@ -845,9 +873,22 @@ def main():
     sequences, feature_names = preprocessor.prepare_data(df_with_anomalies, fit_scaler=True)
     print(f"✓ Created {len(sequences)} sequences with {len(feature_names)} features")
 
-    # Align ground truth
-    ground_truth_aligned = ground_truth[ImprovedConfig.WINDOW_SIZE-1:]
-    ground_truth_aligned = ground_truth_aligned[:len(sequences)]
+    # ---- CRITICAL: Align ground truth with surviving indices ----
+    # Preprocessing drops rows (NaN from technical indicators), so we must
+    # re-index ground_truth to match the rows that actually survive.
+    surviving_indices = preprocessor.surviving_indices_
+    ground_truth_surviving = ground_truth[surviving_indices]
+
+    # Use ANY-in-window labeling: a sequence is anomalous if ANY point
+    # in the 60-step window is anomalous (not just the last point).
+    # This preserves single-point anomaly signals that would otherwise be missed.
+    n_sequences = len(sequences)
+    ground_truth_aligned = np.zeros(n_sequences, dtype=bool)
+    for i in range(n_sequences):
+        ground_truth_aligned[i] = ground_truth_surviving[i:i + ImprovedConfig.WINDOW_SIZE].any()
+
+    print(f"  Ground truth alignment: {surviving_indices.shape[0]} surviving rows, "
+          f"{ground_truth_aligned.sum()} anomalous sequences ({ground_truth_aligned.sum()/len(ground_truth_aligned)*100:.1f}%)")
 
     # Split
     n_samples = len(sequences)
@@ -1018,9 +1059,25 @@ def main():
     # [5] RECONSTRUCTION DETECTOR
     # ========================================================================
     print("\n[5/8] Fitting reconstruction detector...")
+
+    # Build feature weights: emphasize price-sensitive features that anomalies affect
+    price_sensitive = {'close', 'open', 'high', 'low', 'returns', 'log_returns',
+                       'high_low_range', 'close_open_range', 'atr', 'atr_pct'}
+    feature_weights = []
+    for fname in feature_names:
+        if fname.lower() in price_sensitive:
+            feature_weights.append(3.0)
+        elif any(slow in fname.lower() for slow in ['sma', 'ema', 'adx', 'bb_']):
+            feature_weights.append(0.5)
+        else:
+            feature_weights.append(1.0)
+    feature_weights_tensor = torch.FloatTensor(feature_weights)
+    print(f"  Feature weights: {dict(zip(feature_names, feature_weights))}")
+
     recon_detector = ReconstructionBasedDetector(
         reconstructor=model.reconstructor,
-        threshold_percentile=97  # Higher threshold to reduce false positives
+        threshold_percentile=97,  # Higher threshold to reduce false positives
+        feature_weights=feature_weights_tensor
     )
     recon_detector.fit(train_tensor.to(ImprovedConfig.DEVICE))
     print("✓ Reconstruction detector fitted")
@@ -1038,9 +1095,9 @@ def main():
 
         success = train_energy_detector_stable(
             energy_detector,
-            train_loader,
+            train_tensor,
+            train_gt,
             model,
-            cluster_labels_tensor,
             ImprovedConfig
         )
 
@@ -1054,7 +1111,7 @@ def main():
     # [7] THRESHOLD TUNING
     # ========================================================================
     print("\n[7/8] Tuning threshold on validation set...")
-    best_threshold, val_metrics, val_combined_scores = tune_threshold_on_validation(
+    best_threshold, val_metrics, val_combined_scores, val_norm_stats = tune_threshold_on_validation(
         model,
         recon_detector,
         energy_detector,
@@ -1089,10 +1146,13 @@ def main():
             energy_scores = energy_detector(embeddings, cluster_labels=None)
             energy_scores = energy_scores.detach().cpu().numpy() if torch.is_tensor(energy_scores) else energy_scores
 
-            # Robust normalization using percentiles (same as validation)
-            recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
-            energy_p5, energy_p95 = np.percentile(energy_scores, [5, 95])
-            cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
+            # Use VALIDATION normalization stats for consistency with threshold
+            recon_p5 = val_norm_stats['recon_p5']
+            recon_p95 = val_norm_stats['recon_p95']
+            energy_p5 = val_norm_stats['energy_p5']
+            energy_p95 = val_norm_stats['energy_p95']
+            cluster_p5 = val_norm_stats['cluster_p5']
+            cluster_p95 = val_norm_stats['cluster_p95']
 
             recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
             energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
@@ -1110,9 +1170,11 @@ def main():
             final_scores = 0.6 * weighted_sum + 0.4 * max_score
             detection_method = "Hybrid (Reconstruction + Cluster + Energy)"
         else:
-            # Normalize reconstruction and cluster scores
-            recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
-            cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
+            # Use VALIDATION normalization stats for consistency
+            recon_p5 = val_norm_stats['recon_p5']
+            recon_p95 = val_norm_stats['recon_p95']
+            cluster_p5 = val_norm_stats['cluster_p5']
+            cluster_p95 = val_norm_stats['cluster_p95']
 
             recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
             cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)

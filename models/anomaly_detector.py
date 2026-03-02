@@ -110,17 +110,20 @@ class ReconstructionBasedDetector:
         self,
         reconstructor,
         threshold_percentile=95,
-        use_mahalanobis=True
+        use_mahalanobis=True,
+        feature_weights=None
     ):
         """
         Args:
             reconstructor: MaskedTimeSeriesReconstructor model
             threshold_percentile: Percentile for anomaly threshold
             use_mahalanobis: Use Mahalanobis distance instead of Euclidean
+            feature_weights: Optional tensor of per-feature importance weights
         """
         self.reconstructor = reconstructor
         self.threshold_percentile = threshold_percentile
         self.use_mahalanobis = use_mahalanobis
+        self.feature_weights = feature_weights
 
         self.threshold = None
         self.mean = None
@@ -128,7 +131,9 @@ class ReconstructionBasedDetector:
 
     def compute_reconstruction_error(self, x, reconstructed):
         """
-        Compute reconstruction error
+        Compute reconstruction error using MAX over timesteps.
+        This preserves single-point anomaly signals instead of diluting them
+        by averaging over all 60 timesteps.
         Args:
             x: (batch_size, seq_len, n_features) original
             reconstructed: (batch_size, seq_len, n_features) reconstructed
@@ -138,8 +143,24 @@ class ReconstructionBasedDetector:
         # Point-wise squared error
         squared_error = (x - reconstructed) ** 2
 
-        # Average over time and features
-        errors = squared_error.mean(dim=(1, 2))
+        # Apply feature weights if available
+        if hasattr(self, 'feature_weights') and self.feature_weights is not None:
+            weights = self.feature_weights.to(squared_error.device)
+            squared_error = squared_error * weights.unsqueeze(0).unsqueeze(0)
+
+        # Average over features, then combine MAX and MEAN over time
+        # MAX captures the single worst timestep (where the anomaly is)
+        # MEAN provides a baseline reconstruction quality signal
+        per_timestep_error = squared_error.mean(dim=2)  # (batch, seq_len)
+        max_error = per_timestep_error.max(dim=1)[0]    # (batch,)
+        mean_error = per_timestep_error.mean(dim=1)      # (batch,)
+
+        # Top-K average: average of the K worst timesteps (more robust than pure max)
+        k = min(5, per_timestep_error.shape[1])
+        topk_error = per_timestep_error.topk(k, dim=1)[0].mean(dim=1)  # (batch,)
+
+        # Combined: emphasize the peak error but include context
+        errors = 0.5 * topk_error + 0.3 * max_error + 0.2 * mean_error
 
         return errors
 

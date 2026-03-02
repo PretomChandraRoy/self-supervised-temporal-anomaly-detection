@@ -181,8 +181,14 @@ class FinancialDataPreprocessor:
         if self.add_technical_indicators:
             df = self.add_features(df)
 
-        # Drop NaN values
+        # Track which original row positions survive after dropna
+        # Reset index to get integer positions, then track which survive
+        df = df.reset_index(drop=True)
+        n_before_drop = len(df)
         df = df.dropna()
+        # Store surviving integer positions (row numbers in the DataFrame passed to prepare_data)
+        self.surviving_indices_ = df.index.values.copy()  # integer positions that survived dropna
+        df = df.reset_index(drop=True)
 
         # Select numeric columns only
         numeric_df = df.select_dtypes(include=[np.number])
