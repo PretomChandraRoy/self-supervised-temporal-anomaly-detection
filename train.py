@@ -408,22 +408,36 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     # Diagnostic: Score distribution analysis
     normal_mask = val_gt == 0
     anomaly_mask = val_gt == 1
+    n_normal = normal_mask.sum()
+    n_anomaly = anomaly_mask.sum()
     print(f"\n  Score Distribution Analysis:")
-    print(f"    Normal samples:  mean={combined_scores[normal_mask].mean():.4f}, "
-          f"std={combined_scores[normal_mask].std():.4f}, "
-          f"p90={np.percentile(combined_scores[normal_mask], 90):.4f}")
-    print(f"    Anomaly samples: mean={combined_scores[anomaly_mask].mean():.4f}, "
-          f"std={combined_scores[anomaly_mask].std():.4f}, "
-          f"p10={np.percentile(combined_scores[anomaly_mask], 10):.4f}")
+    print(f"    Normal count: {n_normal}, Anomaly count: {n_anomaly}")
 
-    # Check separability
-    normal_p90 = np.percentile(combined_scores[normal_mask], 90)
-    anomaly_p10 = np.percentile(combined_scores[anomaly_mask], 10)
-    if anomaly_p10 > normal_p90:
-        print(f"    ✓ Good separation: anomaly_p10 ({anomaly_p10:.4f}) > normal_p90 ({normal_p90:.4f})")
+    if n_normal > 0:
+        print(f"    Normal samples:  mean={combined_scores[normal_mask].mean():.4f}, "
+              f"std={combined_scores[normal_mask].std():.4f}, "
+              f"p90={np.percentile(combined_scores[normal_mask], 90):.4f}")
     else:
-        print(f"    ⚠️ Poor separation: anomaly_p10 ({anomaly_p10:.4f}) <= normal_p90 ({normal_p90:.4f})")
-        print(f"    Overlap ratio: {(normal_p90 - anomaly_p10) / (combined_scores.max() - combined_scores.min() + 1e-8):.2%}")
+        print(f"    ⚠️ No normal samples in validation set!")
+
+    if n_anomaly > 0:
+        print(f"    Anomaly samples: mean={combined_scores[anomaly_mask].mean():.4f}, "
+              f"std={combined_scores[anomaly_mask].std():.4f}, "
+              f"p10={np.percentile(combined_scores[anomaly_mask], 10):.4f}")
+    else:
+        print(f"    ⚠️ No anomaly samples in validation set!")
+
+    # Check separability (only if both classes present)
+    if n_normal > 0 and n_anomaly > 0:
+        normal_p90 = np.percentile(combined_scores[normal_mask], 90)
+        anomaly_p10 = np.percentile(combined_scores[anomaly_mask], 10)
+        if anomaly_p10 > normal_p90:
+            print(f"    ✓ Good separation: anomaly_p10 ({anomaly_p10:.4f}) > normal_p90 ({normal_p90:.4f})")
+        else:
+            print(f"    ⚠️ Poor separation: anomaly_p10 ({anomaly_p10:.4f}) <= normal_p90 ({normal_p90:.4f})")
+            print(f"    Overlap ratio: {(normal_p90 - anomaly_p10) / (combined_scores.max() - combined_scores.min() + 1e-8):.2%}")
+    else:
+        print(f"    ⚠️ Cannot check separability - need both normal and anomaly samples")
 
     # Multi-stage threshold search with precision constraint
     # Goal: Find threshold that maximizes F1 while maintaining reasonable precision
@@ -879,13 +893,18 @@ def main():
     surviving_indices = preprocessor.surviving_indices_
     ground_truth_surviving = ground_truth[surviving_indices]
 
-    # Use ANY-in-window labeling: a sequence is anomalous if ANY point
-    # in the 60-step window is anomalous (not just the last point).
-    # This preserves single-point anomaly signals that would otherwise be missed.
+    # Use LAST-POINT labeling: a sequence is anomalous if the last point
+    # in the window is anomalous.  The previous "ANY-in-window" approach
+    # labelled almost every sequence as anomalous (98%+) because with 7%
+    # point-level anomaly rate and window=60, the probability that a window
+    # contains zero anomalies is only ~(0.93)^60 ≈ 1%.
     n_sequences = len(sequences)
     ground_truth_aligned = np.zeros(n_sequences, dtype=bool)
     for i in range(n_sequences):
-        ground_truth_aligned[i] = ground_truth_surviving[i:i + ImprovedConfig.WINDOW_SIZE].any()
+        # Label by the last point of the window (index i + WINDOW_SIZE - 1)
+        last_idx = i + ImprovedConfig.WINDOW_SIZE - 1
+        if last_idx < len(ground_truth_surviving):
+            ground_truth_aligned[i] = ground_truth_surviving[last_idx]
 
     print(f"  Ground truth alignment: {surviving_indices.shape[0]} surviving rows, "
           f"{ground_truth_aligned.sum()} anomalous sequences ({ground_truth_aligned.sum()/len(ground_truth_aligned)*100:.1f}%)")
