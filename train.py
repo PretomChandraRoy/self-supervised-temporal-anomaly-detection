@@ -320,9 +320,35 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
     return True
 
 
+def _find_best_threshold_for_component(scores, gt, name, n_steps=300):
+    """Find the threshold that maximises F1 for a single score vector."""
+    best_f1, best_t, best_m = 0, np.median(scores), {'p': 0, 'r': 0, 'f1': 0}
+    lo, hi = np.percentile(scores, 50), np.percentile(scores, 99.9)
+    for t in np.linspace(lo, hi, n_steps):
+        pred = scores > t
+        tp = np.sum(pred & (gt == 1))
+        fp = np.sum(pred & (gt == 0))
+        fn = np.sum(~pred & (gt == 1))
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = t
+            best_m = {'p': p, 'r': r, 'f1': f1}
+    print(f"    {name:12s}: best F1={best_m['f1']:.3f}  P={best_m['p']:.3f}  R={best_m['r']:.3f}  thr={best_t:.4f}")
+    return best_t, best_m
+
+
 def tune_threshold_on_validation(model, recon_detector, energy_detector, clustering, val_data, val_gt, config):
     """
-    Find optimal threshold using validation set with cluster-aware scoring
+    Per-component OR-ensemble threshold tuning.
+
+    Instead of mixing scores into one number (which destroys separation when
+    individual distributions overlap), we find the optimal threshold for EACH
+    component independently and flag a sample as anomalous if ANY component
+    exceeds its own threshold.  We then do a joint grid-search over the three
+    thresholds to maximise combined F1.
     """
     print("\n" + "="*60)
     print("Tuning Threshold on Validation Set")
@@ -331,233 +357,143 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     model.eval()
     val_tensor = torch.FloatTensor(val_data).to(config.DEVICE)
 
-    # Get scores
+    # ---- Collect raw scores ----
     with torch.no_grad():
-        # Reconstruction scores
         recon_scores, _ = recon_detector.predict(val_tensor)
         recon_scores = recon_scores.cpu().numpy() if torch.is_tensor(recon_scores) else recon_scores
 
-        # Get embeddings for clustering and energy
         embeddings = model.get_embeddings(val_tensor)
         embeddings_np = embeddings.cpu().numpy() if torch.is_tensor(embeddings) else embeddings
 
-        # Cluster-based anomaly scores
         cluster_labels = clustering.predict(embeddings_np)
         cluster_scores = clustering.compute_cluster_anomaly_scores(embeddings_np, cluster_labels)
 
+        energy_scores = None
         if config.USE_HYBRID and energy_detector is not None:
-            # Energy scores
-            energy_scores = energy_detector(embeddings, cluster_labels=None)
-            energy_scores = energy_scores.cpu().numpy() if torch.is_tensor(energy_scores) else energy_scores
+            energy_scores_t = energy_detector(embeddings, cluster_labels=None)
+            energy_scores = energy_scores_t.cpu().numpy() if torch.is_tensor(energy_scores_t) else energy_scores_t
 
-            # Robust normalization using percentiles to handle outliers
-            recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
-            energy_p5, energy_p95 = np.percentile(energy_scores, [5, 95])
-            cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
-
-            recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
-            energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
-            cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
-
-            # Combined scores using BOTH weighted sum and max
-            # Max helps catch anomalies that are extreme in ANY dimension
-            weighted_sum = (config.RECON_WEIGHT * recon_norm +
-                           config.CLUSTER_WEIGHT * cluster_norm +
-                           config.ENERGY_WEIGHT * energy_norm)
-
-            # Stack and take max across components
-            max_score = np.maximum.reduce([recon_norm, cluster_norm, energy_norm])
-
-            # Combine: if any component is very high, boost the score
-            combined_scores = 0.6 * weighted_sum + 0.4 * max_score
-        else:
-            # Normalize reconstruction and cluster scores
-            recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
-            cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
-
-            recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
-            cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
-
-            # Use weighted sum + max
-            total_weight = config.RECON_WEIGHT + config.CLUSTER_WEIGHT
-            weighted_sum = ((config.RECON_WEIGHT / total_weight) * recon_norm +
-                           (config.CLUSTER_WEIGHT / total_weight) * cluster_norm)
-            max_score = np.maximum(recon_norm, cluster_norm)
-            combined_scores = 0.6 * weighted_sum + 0.4 * max_score
-
-    # Add Isolation Forest scores if enabled
-    if hasattr(config, 'USE_ISOLATION_FOREST') and config.USE_ISOLATION_FOREST:
-        try:
-            from sklearn.ensemble import IsolationForest
-            # Reshape data for isolation forest
-            val_flat = val_data.reshape(val_data.shape[0], -1)
-            iso_forest = IsolationForest(
-                contamination=config.ISOLATION_CONTAMINATION,
-                random_state=42,
-                n_estimators=200
-            )
-            iso_scores = -iso_forest.fit_predict(val_flat)  # -1 for anomaly, 1 for normal -> flip
-            iso_scores = (iso_scores + 1) / 2  # Normalize to 0-1
-
-            # Ensemble with isolation forest (adds precision)
-            combined_scores = 0.7 * combined_scores + 0.3 * iso_scores
-            print("  ✓ Isolation Forest ensemble enabled")
-        except Exception as e:
-            print(f"  ⚠️ Isolation Forest failed: {e}")
-
-    # Diagnostic: Score distribution analysis
+    # ---- Per-component diagnostics ----
     normal_mask = val_gt == 0
     anomaly_mask = val_gt == 1
-    n_normal = normal_mask.sum()
-    n_anomaly = anomaly_mask.sum()
-    print(f"\n  Score Distribution Analysis:")
-    print(f"    Normal count: {n_normal}, Anomaly count: {n_anomaly}")
+    n_normal = int(normal_mask.sum())
+    n_anomaly = int(anomaly_mask.sum())
+    print(f"\n  Validation: {n_normal} normal, {n_anomaly} anomalous")
 
-    if n_normal > 0:
-        print(f"    Normal samples:  mean={combined_scores[normal_mask].mean():.4f}, "
-              f"std={combined_scores[normal_mask].std():.4f}, "
-              f"p90={np.percentile(combined_scores[normal_mask], 90):.4f}")
-    else:
-        print(f"    ⚠️ No normal samples in validation set!")
+    components = {'recon': recon_scores, 'cluster': cluster_scores}
+    if energy_scores is not None:
+        components['energy'] = energy_scores
 
-    if n_anomaly > 0:
-        print(f"    Anomaly samples: mean={combined_scores[anomaly_mask].mean():.4f}, "
-              f"std={combined_scores[anomaly_mask].std():.4f}, "
-              f"p10={np.percentile(combined_scores[anomaly_mask], 10):.4f}")
-    else:
-        print(f"    ⚠️ No anomaly samples in validation set!")
+    print("\n  Per-component score distributions:")
+    for name, sc in components.items():
+        if n_normal > 0 and n_anomaly > 0:
+            nm, am = sc[normal_mask].mean(), sc[anomaly_mask].mean()
+            ns, asd = sc[normal_mask].std(), sc[anomaly_mask].std()
+            sep = (am - nm) / (0.5 * (ns + asd) + 1e-8)
+            print(f"    {name:12s}: normal={nm:.4f}±{ns:.4f}  anomaly={am:.4f}±{asd:.4f}  "
+                  f"d'={sep:.3f}")
 
-    # Check separability (only if both classes present)
-    if n_normal > 0 and n_anomaly > 0:
-        normal_p90 = np.percentile(combined_scores[normal_mask], 90)
-        anomaly_p10 = np.percentile(combined_scores[anomaly_mask], 10)
-        if anomaly_p10 > normal_p90:
-            print(f"    ✓ Good separation: anomaly_p10 ({anomaly_p10:.4f}) > normal_p90 ({normal_p90:.4f})")
-        else:
-            print(f"    ⚠️ Poor separation: anomaly_p10 ({anomaly_p10:.4f}) <= normal_p90 ({normal_p90:.4f})")
-            print(f"    Overlap ratio: {(normal_p90 - anomaly_p10) / (combined_scores.max() - combined_scores.min() + 1e-8):.2%}")
-    else:
-        print(f"    ⚠️ Cannot check separability - need both normal and anomaly samples")
+    # ---- Find best per-component threshold ----
+    print("\n  Per-component best F1:")
+    comp_thresholds = {}
+    comp_metrics = {}
+    for name, sc in components.items():
+        t, m = _find_best_threshold_for_component(sc, val_gt, name)
+        comp_thresholds[name] = t
+        comp_metrics[name] = m
 
-    # Multi-stage threshold search with precision constraint
-    # Goal: Find threshold that maximizes F1 while maintaining reasonable precision
-
-    MIN_PRECISION = getattr(config, 'MIN_PRECISION', 0.20)  # Require at least 20% precision
-
-    # Stage 1: Wide search starting from 50th percentile
-    thresholds = np.linspace(
-        np.percentile(combined_scores, 50),  # Start from 50th percentile
-        np.percentile(combined_scores, 99.9),
-        config.THRESHOLD_SEARCH_STEPS
-    )
+    # ---- OR-ensemble: joint grid search over multipliers ----
+    # For each component, search thresholds around the best one found above.
+    # A sample is anomalous if ANY component score exceeds its threshold.
+    print("\n  OR-ensemble joint search...")
 
     best_f1 = 0
-    best_threshold = np.percentile(combined_scores, 95)
+    best_thresholds = dict(comp_thresholds)
     best_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
 
-    # Track best precision-constrained solution
-    best_constrained_score = 0
-    best_constrained_threshold = best_threshold
-    best_constrained_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
+    # Build per-component search grids (narrow range around each best threshold)
+    grids = {}
+    for name, sc in components.items():
+        center = comp_thresholds[name]
+        sc_range = np.percentile(sc, 99) - np.percentile(sc, 50)
+        lo = center - 0.3 * sc_range
+        hi = center + 0.3 * sc_range
+        grids[name] = np.linspace(lo, hi, 20)
 
-    for threshold in thresholds:
-        predictions = combined_scores > threshold
+    comp_names = list(components.keys())
+    comp_arrays = [components[n] for n in comp_names]
+    comp_grids = [grids[n] for n in comp_names]
 
-        tp = np.sum((predictions == True) & (val_gt == True))
-        fp = np.sum((predictions == True) & (val_gt == False))
-        fn = np.sum((predictions == False) & (val_gt == True))
+    # Iterate over all combinations (20^2 or 20^3 = 400 or 8000 – very fast)
+    from itertools import product as iter_product
+    for thrs in iter_product(*comp_grids):
+        # OR-ensemble: anomalous if ANY component exceeds its threshold
+        pred = np.zeros(len(val_gt), dtype=bool)
+        for sc_arr, t in zip(comp_arrays, thrs):
+            pred |= (sc_arr > t)
 
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        tp = np.sum(pred & (val_gt == 1))
+        fp = np.sum(pred & (val_gt == 0))
+        fn = np.sum(~pred & (val_gt == 1))
 
-        # Track best unconstrained F1
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+
         if f1 > best_f1:
             best_f1 = f1
-            best_threshold = threshold
-            best_metrics = {'precision': precision, 'recall': recall, 'f1': f1}
+            best_thresholds = dict(zip(comp_names, thrs))
+            best_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
 
-        # Track best precision-constrained solution
-        if precision >= MIN_PRECISION:
-            score = f1  # Or use f1 + 0.1 * precision for precision bonus
-            if score > best_constrained_score:
-                best_constrained_score = score
-                best_constrained_threshold = threshold
-                best_constrained_metrics = {'precision': precision, 'recall': recall, 'f1': f1}
-
-    # Stage 2: Fine search around best constrained threshold
-    if best_constrained_metrics['f1'] > 0:
-        fine_range = np.linspace(
-            max(combined_scores.min(), best_constrained_threshold - 0.15),
-            min(combined_scores.max(), best_constrained_threshold + 0.15),
-            config.THRESHOLD_SEARCH_STEPS
-        )
-
-        for threshold in fine_range:
-            predictions = combined_scores > threshold
-
-            tp = np.sum((predictions == True) & (val_gt == True))
-            fp = np.sum((predictions == True) & (val_gt == False))
-            fn = np.sum((predictions == False) & (val_gt == True))
-
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-
-            if precision >= MIN_PRECISION and f1 > best_constrained_score:
-                best_constrained_score = f1
-                best_constrained_threshold = threshold
-                best_constrained_metrics = {'precision': precision, 'recall': recall, 'f1': f1}
-
-    # Choose between constrained and unconstrained
-    if best_constrained_metrics['f1'] >= 0.15:  # Use constrained if it has reasonable F1
-        best_threshold = best_constrained_threshold
-        best_metrics = best_constrained_metrics
-        print(f"  Using precision-constrained threshold (P >= {MIN_PRECISION:.0%})")
+    # Also try the weighted-sum approach as a fallback (keep best of both)
+    # Percentile normalisation + weighted sum
+    recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
+    cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
+    recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
+    cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
+    if energy_scores is not None:
+        energy_p5, energy_p95 = np.percentile(energy_scores, [5, 95])
+        energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
+        ws = config.RECON_WEIGHT * recon_norm + config.CLUSTER_WEIGHT * cluster_norm + config.ENERGY_WEIGHT * energy_norm
     else:
-        # Stage 3: If no good constrained solution, optimize for balanced F1 with precision bonus
-        print("  ⚠️ No good precision-constrained solution, using precision-weighted search...")
+        energy_p5, energy_p95 = 0, 1
+        energy_norm = np.zeros_like(recon_norm)
+        tw = config.RECON_WEIGHT + config.CLUSTER_WEIGHT
+        ws = (config.RECON_WEIGHT / tw) * recon_norm + (config.CLUSTER_WEIGHT / tw) * cluster_norm
+    combined_scores = ws  # For return / visualizations
 
-        for threshold in np.linspace(
-            np.percentile(combined_scores, 80),
-            np.percentile(combined_scores, 99.5),
-            100
-        ):
-            predictions = combined_scores > threshold
-            tp = np.sum((predictions == True) & (val_gt == True))
-            fp = np.sum((predictions == True) & (val_gt == False))
-            fn = np.sum((predictions == False) & (val_gt == True))
+    # Single-threshold search on weighted sum
+    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum')
+    print(f"\n  OR-ensemble best:   F1={best_metrics['f1']:.3f}  P={best_metrics['precision']:.3f}  R={best_metrics['recall']:.3f}")
+    print(f"  Weighted-sum best:  F1={ws_m['f1']:.3f}  P={ws_m['p']:.3f}  R={ws_m['r']:.3f}")
 
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-
-            # Weighted score favoring precision
-            weighted_score = f1 + 0.3 * precision
-
-            if weighted_score > best_f1 + 0.3 * best_metrics['precision']:
-                best_f1 = f1
-                best_threshold = threshold
-                best_metrics = {'precision': precision, 'recall': recall, 'f1': f1}
-
-    print(f"✓ Best threshold: {best_threshold:.4f}")
-    print(f"  Val F1: {best_metrics['f1']:.3f}, Precision: {best_metrics['precision']:.3f}, Recall: {best_metrics['recall']:.3f}")
-
-    # Store normalization statistics for reuse on test set
-    norm_stats = {}
-    if config.USE_HYBRID and energy_detector is not None:
-        norm_stats = {
-            'recon_p5': recon_p5, 'recon_p95': recon_p95,
-            'energy_p5': energy_p5, 'energy_p95': energy_p95,
-            'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
-        }
+    # Pick whichever strategy won
+    use_or_ensemble = best_metrics['f1'] >= ws_m['f1']
+    if use_or_ensemble:
+        print(f"  → Using OR-ensemble (better F1)")
+        for n in comp_names:
+            print(f"    {n} threshold = {best_thresholds[n]:.4f}")
     else:
-        norm_stats = {
-            'recon_p5': recon_p5, 'recon_p95': recon_p95,
-            'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
-        }
+        print(f"  → Using weighted-sum (better F1)")
+        best_metrics = {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}
+        # Store weighted-sum threshold as a single 'combined' threshold
+        best_thresholds = {'combined': ws_t}
+        combined_scores = ws
 
-    return best_threshold, best_metrics, combined_scores, norm_stats
+    print(f"\n✓ Best Val F1: {best_metrics['f1']:.3f}, Precision: {best_metrics['precision']:.3f}, Recall: {best_metrics['recall']:.3f}")
+
+    # Pack norm stats for test-set reuse
+    norm_stats = {
+        'recon_p5': recon_p5, 'recon_p95': recon_p95,
+        'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
+        'energy_p5': energy_p5, 'energy_p95': energy_p95,
+        'use_or_ensemble': use_or_ensemble,
+        'comp_thresholds': best_thresholds,
+    }
+
+    # Return: threshold (single number for backward compat), metrics, scores, stats
+    single_threshold = best_thresholds.get('combined', 0.5)
+    return single_threshold, best_metrics, combined_scores, norm_stats
 
 
 def save_training_plots(train_losses, val_losses, output_dir):
@@ -1157,76 +1093,63 @@ def main():
         embeddings = model.get_embeddings(test_tensor_gpu)
         embeddings_np = embeddings.cpu().numpy() if torch.is_tensor(embeddings) else embeddings
 
-        # Cluster-based anomaly scores (CRITICAL for precision)
+        # Cluster-based anomaly scores
         test_cluster_labels = clustering.predict(embeddings_np)
         cluster_scores = clustering.compute_cluster_anomaly_scores(embeddings_np, test_cluster_labels)
 
+        energy_scores = None
         if ImprovedConfig.USE_HYBRID and energy_detector is not None:
-            # Energy scores
-            energy_scores = energy_detector(embeddings, cluster_labels=None)
-            energy_scores = energy_scores.detach().cpu().numpy() if torch.is_tensor(energy_scores) else energy_scores
+            energy_scores_t = energy_detector(embeddings, cluster_labels=None)
+            energy_scores = energy_scores_t.detach().cpu().numpy() if torch.is_tensor(energy_scores_t) else energy_scores_t
 
-            # Use VALIDATION normalization stats for consistency with threshold
-            recon_p5 = val_norm_stats['recon_p5']
-            recon_p95 = val_norm_stats['recon_p95']
+    # ---- Determine predictions using same strategy as validation ----
+    use_or = val_norm_stats.get('use_or_ensemble', False)
+    comp_thresholds = val_norm_stats.get('comp_thresholds', {})
+
+    if use_or:
+        # OR-ensemble: anomalous if ANY component exceeds its threshold
+        predictions = np.zeros(len(test_gt), dtype=bool)
+        components = {'recon': recon_scores, 'cluster': cluster_scores}
+        if energy_scores is not None:
+            components['energy'] = energy_scores
+
+        for name, sc in components.items():
+            if name in comp_thresholds:
+                predictions |= (sc > comp_thresholds[name])
+
+        detection_method = "OR-Ensemble (Reconstruction | Cluster | Energy)"
+        # For visualisations, build a combined score (max of per-component z-like scores)
+        final_scores = np.maximum.reduce([
+            (recon_scores - recon_scores.mean()) / (recon_scores.std() + 1e-8),
+            (cluster_scores - cluster_scores.mean()) / (cluster_scores.std() + 1e-8),
+        ] + ([
+            (energy_scores - energy_scores.mean()) / (energy_scores.std() + 1e-8)
+        ] if energy_scores is not None else []))
+    else:
+        # Weighted-sum with single threshold (fallback)
+        recon_p5 = val_norm_stats['recon_p5']
+        recon_p95 = val_norm_stats['recon_p95']
+        cluster_p5 = val_norm_stats['cluster_p5']
+        cluster_p95 = val_norm_stats['cluster_p95']
+
+        recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
+        cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
+
+        if energy_scores is not None:
             energy_p5 = val_norm_stats['energy_p5']
             energy_p95 = val_norm_stats['energy_p95']
-            cluster_p5 = val_norm_stats['cluster_p5']
-            cluster_p95 = val_norm_stats['cluster_p95']
-
-            recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
             energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
-            cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
-
-            # Combined scores using BOTH weighted sum and max (same as validation)
-            weighted_sum = (ImprovedConfig.RECON_WEIGHT * recon_norm +
+            final_scores = (ImprovedConfig.RECON_WEIGHT * recon_norm +
                            ImprovedConfig.CLUSTER_WEIGHT * cluster_norm +
                            ImprovedConfig.ENERGY_WEIGHT * energy_norm)
-
-            # Stack and take max across components
-            max_score = np.maximum.reduce([recon_norm, cluster_norm, energy_norm])
-
-            # Combine: if any component is very high, boost the score
-            final_scores = 0.6 * weighted_sum + 0.4 * max_score
             detection_method = "Hybrid (Reconstruction + Cluster + Energy)"
         else:
-            # Use VALIDATION normalization stats for consistency
-            recon_p5 = val_norm_stats['recon_p5']
-            recon_p95 = val_norm_stats['recon_p95']
-            cluster_p5 = val_norm_stats['cluster_p5']
-            cluster_p95 = val_norm_stats['cluster_p95']
-
-            recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
-            cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
-
-            # Use weighted sum + max
-            total_weight = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT
-            weighted_sum = ((ImprovedConfig.RECON_WEIGHT / total_weight) * recon_norm +
-                           (ImprovedConfig.CLUSTER_WEIGHT / total_weight) * cluster_norm)
-            max_score = np.maximum(recon_norm, cluster_norm)
-            final_scores = 0.6 * weighted_sum + 0.4 * max_score
+            tw = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT
+            final_scores = ((ImprovedConfig.RECON_WEIGHT / tw) * recon_norm +
+                           (ImprovedConfig.CLUSTER_WEIGHT / tw) * cluster_norm)
             detection_method = "Hybrid (Reconstruction + Cluster)"
 
-    # Add Isolation Forest scores if enabled
-    if hasattr(ImprovedConfig, 'USE_ISOLATION_FOREST') and ImprovedConfig.USE_ISOLATION_FOREST:
-        try:
-            from sklearn.ensemble import IsolationForest
-            test_flat = test_data.reshape(test_data.shape[0], -1)
-            iso_forest = IsolationForest(
-                contamination=ImprovedConfig.ISOLATION_CONTAMINATION,
-                random_state=42,
-                n_estimators=200
-            )
-            iso_scores = -iso_forest.fit_predict(test_flat)
-            iso_scores = (iso_scores + 1) / 2
-
-            final_scores = 0.7 * final_scores + 0.3 * iso_scores
-            detection_method += " + Isolation Forest"
-        except Exception as e:
-            print(f"  ⚠️ Isolation Forest failed on test: {e}")
-
-    # Apply threshold
-    predictions = final_scores > best_threshold
+        predictions = final_scores > best_threshold
 
     # Compute metrics
     tp = np.sum((predictions == True) & (test_gt == True))
