@@ -80,6 +80,9 @@ class TemporalTransformerEncoder(nn.Module):
         # Layer normalization
         self.layer_norm = nn.LayerNorm(d_model)
 
+        # Pooling projection: mean + max pooled → d_model
+        self.pool_projection = nn.Linear(d_model * 2, d_model)
+
     def forward(self, x, mask=None):
         """
         Args:
@@ -104,7 +107,9 @@ class TemporalTransformerEncoder(nn.Module):
 
     def get_sequence_embedding(self, x, mask=None):
         """
-        Get global sequence embedding using mean pooling
+        Get global sequence embedding using mean + max pooling.
+        Max-pooling preserves single-timestep anomaly peaks that
+        mean-pooling would dilute by 1/seq_len.
         Args:
             x: (batch_size, seq_len, n_features)
         Returns:
@@ -112,8 +117,11 @@ class TemporalTransformerEncoder(nn.Module):
         """
         encoded = self.forward(x, mask)  # (B, L, d_model)
 
-        # Mean pooling over time dimension
-        embedding = encoded.mean(dim=1)  # (B, d_model)
+        mean_pool = encoded.mean(dim=1)  # (B, d_model)
+        max_pool = encoded.max(dim=1)[0]  # (B, d_model)
+
+        combined = torch.cat([mean_pool, max_pool], dim=1)  # (B, d_model*2)
+        embedding = self.pool_projection(combined)           # (B, d_model)
 
         return embedding
 

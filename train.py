@@ -76,18 +76,18 @@ class ImprovedConfig:
     N_CLUSTERS = 8  # Reduced for clearer separation
     MIN_CLUSTER_SIZE = 100  # Require larger clusters
 
-    # Hybrid Detection - Balanced weights for all three components
+    # Hybrid Detection - Reconstruction is now strongest (bottleneck makes it discriminative)
     USE_HYBRID = True
-    ENERGY_WEIGHT = 0.30  # Energy detector weight (important for thesis)
-    RECON_WEIGHT = 0.45   # Reconstruction weight (most reliable)
-    CLUSTER_WEIGHT = 0.25 # Cluster-based anomaly scoring weight
+    ENERGY_WEIGHT = 0.20  # Energy detector weight (important for thesis)
+    RECON_WEIGHT = 0.60   # Reconstruction weight (strongest with bottleneck)
+    CLUSTER_WEIGHT = 0.20 # Cluster-based anomaly scoring weight
 
     # Precision constraint for threshold tuning
     MIN_PRECISION = 0.30  # Require higher precision to reduce false positives
 
-    # Anomaly Injection - Moderate intensity for better detectability
+    # Anomaly Injection - Higher intensity since we no longer clip outliers
     ANOMALY_RATIO = 0.07  # 7% anomalies for sufficient training signal
-    ANOMALY_INTENSITY = 2.5  # REDUCED - too high causes clipping/normalization issues
+    ANOMALY_INTENSITY = 4.0  # INCREASED - no more clipping, need strong post-scaling signal
 
     # Threshold Tuning - More granular search at higher percentiles
     USE_VALIDATION_TUNING = True
@@ -442,11 +442,11 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     # Multi-stage threshold search with precision constraint
     # Goal: Find threshold that maximizes F1 while maintaining reasonable precision
 
-    MIN_PRECISION = getattr(config, 'MIN_PRECISION', 0.30)  # Require at least 30% precision
+    MIN_PRECISION = getattr(config, 'MIN_PRECISION', 0.20)  # Require at least 20% precision
 
-    # Stage 1: Wide search starting from 70th percentile (focus on precision)
+    # Stage 1: Wide search starting from 50th percentile
     thresholds = np.linspace(
-        np.percentile(combined_scores, 70),  # Start from 70th percentile
+        np.percentile(combined_scores, 50),  # Start from 50th percentile
         np.percentile(combined_scores, 99.9),
         config.THRESHOLD_SEARCH_STEPS
     )
@@ -878,10 +878,11 @@ def main():
         intensity=ImprovedConfig.ANOMALY_INTENSITY
     )
 
-    # Preprocess
+    # Preprocess — clip_outliers=False so injected anomalies survive into model input
     preprocessor = FinancialDataPreprocessor(
         window_size=ImprovedConfig.WINDOW_SIZE,
-        stride=1
+        stride=1,
+        clip_outliers=False
     )
 
     sequences, feature_names = preprocessor.prepare_data(df_with_anomalies, fit_scaler=True)

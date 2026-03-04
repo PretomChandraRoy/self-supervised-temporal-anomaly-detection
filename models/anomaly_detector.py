@@ -131,9 +131,10 @@ class ReconstructionBasedDetector:
 
     def compute_reconstruction_error(self, x, reconstructed):
         """
-        Compute reconstruction error using MAX over timesteps.
-        This preserves single-point anomaly signals instead of diluting them
-        by averaging over all 60 timesteps.
+        Compute reconstruction error focusing on the single worst timestep.
+        Uses max-over-features per timestep so that a spike in even one
+        feature (e.g. close price) produces a high per-timestep error.
+        Then takes max over timesteps to capture point anomalies.
         Args:
             x: (batch_size, seq_len, n_features) original
             reconstructed: (batch_size, seq_len, n_features) reconstructed
@@ -148,19 +149,23 @@ class ReconstructionBasedDetector:
             weights = self.feature_weights.to(squared_error.device)
             squared_error = squared_error * weights.unsqueeze(0).unsqueeze(0)
 
-        # Average over features, then combine MAX and MEAN over time
-        # MAX captures the single worst timestep (where the anomaly is)
-        # MEAN provides a baseline reconstruction quality signal
-        per_timestep_error = squared_error.mean(dim=2)  # (batch, seq_len)
-        max_error = per_timestep_error.max(dim=1)[0]    # (batch,)
-        mean_error = per_timestep_error.mean(dim=1)      # (batch,)
+        # Per-timestep error: use MAX over features (not mean)
+        # so a spike in any single feature is not diluted
+        per_timestep_max = squared_error.max(dim=2)[0]   # (batch, seq_len)
+        per_timestep_mean = squared_error.mean(dim=2)      # (batch, seq_len)
 
-        # Top-K average: average of the K worst timesteps (more robust than pure max)
-        k = min(5, per_timestep_error.shape[1])
+        # Combine: emphasize the feature-max but include mean as context
+        per_timestep_error = 0.7 * per_timestep_max + 0.3 * per_timestep_mean
+
+        # Over time: max captures the anomalous timestep
+        max_error = per_timestep_error.max(dim=1)[0]       # (batch,)
+
+        # Top-K: more robust than pure max
+        k = min(3, per_timestep_error.shape[1])
         topk_error = per_timestep_error.topk(k, dim=1)[0].mean(dim=1)  # (batch,)
 
-        # Combined: emphasize the peak error but include context
-        errors = 0.5 * topk_error + 0.3 * max_error + 0.2 * mean_error
+        # Combined: heavily weight the peak
+        errors = 0.6 * max_error + 0.4 * topk_error
 
         return errors
 
@@ -199,16 +204,19 @@ class ReconstructionBasedDetector:
 
     def fit(self, x):
         """
-        Fit detector on normal data to establish threshold
+        Fit detector on normal data to establish threshold.
+        Uses the same bottleneck approach as predict().
         Args:
             x: (n_samples, seq_len, n_features) normal training data
         """
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Get reconstructions without masking
+            # Encode and bottleneck (same as predict)
             encoder_output = self.reconstructor.encoder(x)
-            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
+            bottleneck = encoder_output.mean(dim=1, keepdim=True)
+            bottleneck_expanded = bottleneck.expand_as(encoder_output)
+            reconstructed = self.reconstructor.reconstruction_head(bottleneck_expanded)
 
             if self.use_mahalanobis:
                 # Fit covariance on residuals
@@ -245,7 +253,11 @@ class ReconstructionBasedDetector:
 
     def predict(self, x):
         """
-        Predict anomaly scores based on reconstruction error
+        Predict anomaly scores based on reconstruction error.
+        Uses a BOTTLENECK approach: the encoder output is mean-pooled
+        into a single vector and then expanded back to seq_len, forcing
+        information loss.  This means anomalous timesteps cannot be
+        trivially copied through, producing higher reconstruction error.
         Args:
             x: (batch_size, seq_len, n_features)
         Returns:
@@ -255,9 +267,15 @@ class ReconstructionBasedDetector:
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Get reconstruction
-            encoder_output = self.reconstructor.encoder(x)
-            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
+            # Encode full sequence
+            encoder_output = self.reconstructor.encoder(x)  # (B, L, d_model)
+
+            # Bottleneck: compress to single vector, then expand back
+            bottleneck = encoder_output.mean(dim=1, keepdim=True)  # (B, 1, d_model)
+            bottleneck_expanded = bottleneck.expand_as(encoder_output)  # (B, L, d_model)
+
+            # Reconstruct from bottleneck (anomalous timesteps lose their signal)
+            reconstructed = self.reconstructor.reconstruction_head(bottleneck_expanded)
 
             if self.use_mahalanobis and self.cov_inv is not None:
                 scores = self.compute_mahalanobis_distance(x, reconstructed)
