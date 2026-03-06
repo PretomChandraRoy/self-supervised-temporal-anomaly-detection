@@ -48,21 +48,22 @@ class ImprovedConfig:
     VAL_RATIO = 0.15
     TEST_RATIO = 0.15
 
-    # Model Architecture - Increased capacity
-    D_MODEL = 192  # Increased for better representation
+    # Model Architecture - Right-sized to avoid memorizing anomalies
+    D_MODEL = 128  # Smaller to prevent memorization
     N_HEADS = 8
-    N_LAYERS = 5  # Deeper model
-    DROPOUT = 0.2  # Higher dropout to prevent overfitting
+    N_LAYERS = 4  # Fewer layers
+    DROPOUT = 0.15
+    MASK_RATIO = 0.30  # Higher mask ratio forces learning from context
 
     # Training - Extended with better convergence
     N_EPOCHS = 150  # More epochs for better convergence
     BATCH_SIZE = 64  # Larger batch for stability
-    LEARNING_RATE = 1e-4  # Slightly higher LR with larger batch
+    LEARNING_RATE = 5e-4  # Higher LR since model is smaller
     WEIGHT_DECAY = 1e-4  # Stronger regularization
     GRADIENT_CLIP = 1.0  # Standard clipping
 
-    # Loss weights - Emphasize reconstruction for anomaly detection
-    CONTRASTIVE_WEIGHT = 0.1  # Moderate contrastive learning
+    # Loss weights - Reconstruction-focused for anomaly detection
+    CONTRASTIVE_WEIGHT = 0.05  # Low - contrastive is secondary
     RECONSTRUCTION_WEIGHT = 1.0
 
     # Energy detector - More training with better hyperparameters
@@ -76,18 +77,18 @@ class ImprovedConfig:
     N_CLUSTERS = 8  # Reduced for clearer separation
     MIN_CLUSTER_SIZE = 100  # Require larger clusters
 
-    # Hybrid Detection - Reconstruction is now strongest (bottleneck makes it discriminative)
+    # Hybrid Detection - Reconstruction dominates (trained on normals only)
     USE_HYBRID = True
-    ENERGY_WEIGHT = 0.20  # Energy detector weight (important for thesis)
-    RECON_WEIGHT = 0.60   # Reconstruction weight (strongest with bottleneck)
-    CLUSTER_WEIGHT = 0.20 # Cluster-based anomaly scoring weight
+    ENERGY_WEIGHT = 0.15  # Energy detector weight (important for thesis)
+    RECON_WEIGHT = 0.70   # Reconstruction weight (strongest - normal-only training)
+    CLUSTER_WEIGHT = 0.15 # Cluster-based anomaly scoring weight
 
     # Precision constraint for threshold tuning
     MIN_PRECISION = 0.30  # Require higher precision to reduce false positives
 
-    # Anomaly Injection - Higher intensity since we no longer clip outliers
+    # Anomaly Injection - Moderate intensity for realistic anomalies
     ANOMALY_RATIO = 0.07  # 7% anomalies for sufficient training signal
-    ANOMALY_INTENSITY = 4.0  # INCREASED - no more clipping, need strong post-scaling signal
+    ANOMALY_INTENSITY = 2.5  # Moderate - strong enough to detect, not unrealistic
 
     # Threshold Tuning - More granular search at higher percentiles
     USE_VALIDATION_TUNING = True
@@ -102,7 +103,7 @@ class ImprovedConfig:
     # System
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     OUTPUT_DIR = 'improved_outputs'
-    EARLY_STOPPING_PATIENCE = 30  # More patience
+    EARLY_STOPPING_PATIENCE = 20  # Faster convergence on normal-only data
 
     # Reporting
     SAVE_PLOTS = True
@@ -1487,11 +1488,23 @@ def main():
     print(f"  Test anomalies: {test_gt.sum()} ({test_gt.sum()/len(test_gt)*100:.1f}%)")
 
     # Create loaders
-    train_tensor = torch.FloatTensor(train_data)
+    # CRITICAL: Train autoencoder on NORMAL data ONLY
+    # This is the standard approach for anomaly detection autoencoders:
+    # the model learns to reconstruct normal patterns well, and anomalies
+    # produce high reconstruction error because the model has never seen them.
+    train_normal_mask = ~train_gt.astype(bool)
+    train_normal_data = train_data[train_normal_mask]
+    print(f"  Autoencoder training: {train_normal_mask.sum()} normal sequences "
+          f"(excluded {(~train_normal_mask).sum()} anomalies)")
+
+    train_normal_tensor = torch.FloatTensor(train_normal_data)
+    train_tensor = torch.FloatTensor(train_data)  # Full data for energy detector
     val_tensor = torch.FloatTensor(val_data)
     test_tensor = torch.FloatTensor(test_data)
 
-    train_loader = DataLoader(TensorDataset(train_tensor), batch_size=ImprovedConfig.BATCH_SIZE, shuffle=True)
+    # Autoencoder trains on normal-only data
+    train_loader = DataLoader(TensorDataset(train_normal_tensor), batch_size=ImprovedConfig.BATCH_SIZE, shuffle=True)
+    # Validation uses ALL data (anomalies increase val loss = good stopping signal)
     val_loader = DataLoader(TensorDataset(val_tensor), batch_size=ImprovedConfig.BATCH_SIZE, shuffle=False)
 
     # ========================================================================
@@ -1506,6 +1519,7 @@ def main():
         n_heads=ImprovedConfig.N_HEADS,
         n_layers=ImprovedConfig.N_LAYERS,
         dropout=ImprovedConfig.DROPOUT,
+        mask_ratio=ImprovedConfig.MASK_RATIO,
         contrastive_weight=ImprovedConfig.CONTRASTIVE_WEIGHT,
         reconstruction_weight=ImprovedConfig.RECONSTRUCTION_WEIGHT
     ).to(ImprovedConfig.DEVICE)
@@ -1601,18 +1615,22 @@ def main():
     # ========================================================================
     print("\n[4/8] Performing clustering...")
 
-    # Extract embeddings
+    # Extract embeddings - fit clusters on normal data only
     model.eval()
     with torch.no_grad():
-        train_embeddings = model.get_embeddings(train_tensor.to(ImprovedConfig.DEVICE)).cpu().numpy()
+        train_normal_embeddings = model.get_embeddings(
+            train_normal_tensor.to(ImprovedConfig.DEVICE)).cpu().numpy()
+        train_embeddings = model.get_embeddings(
+            train_tensor.to(ImprovedConfig.DEVICE)).cpu().numpy()
 
-    # Cluster
+    # Cluster on normal data only (clusters represent normal patterns)
     clustering = DensityAwareClustering(
         n_clusters=ImprovedConfig.N_CLUSTERS,
         min_cluster_size=ImprovedConfig.MIN_CLUSTER_SIZE
     )
-    clustering.fit(train_embeddings)
-    cluster_labels = clustering.labels_
+    clustering.fit(train_normal_embeddings)
+    # Predict cluster labels for ALL training data (needed by energy detector)
+    cluster_labels = clustering.predict(train_embeddings)
 
     print(f"✓ Created {len(np.unique(cluster_labels))} clusters")
     print(f"  Cluster sizes: {np.bincount(cluster_labels)}")
@@ -1658,8 +1676,9 @@ def main():
         threshold_percentile=97,  # Higher threshold to reduce false positives
         feature_weights=feature_weights_tensor
     )
-    recon_detector.fit(train_tensor.to(ImprovedConfig.DEVICE))
-    print("✓ Reconstruction detector fitted")
+    # Fit on NORMAL data only — threshold reflects normal reconstruction quality
+    recon_detector.fit(train_normal_tensor.to(ImprovedConfig.DEVICE))
+    print("✓ Reconstruction detector fitted (on normal data only)")
 
     # ========================================================================
     # [6] ENERGY DETECTOR (STABLE)
