@@ -209,9 +209,14 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
 
         anomaly_mask[idx] = True
 
+    # Build per-sample anomaly type map (index -> type string)
+    anomaly_type_map = {}
+    for idx, atype in zip(anomaly_indices, anomaly_types):
+        anomaly_type_map[idx] = atype
+
     print(f"✓ Injected {n_anomalies} diverse anomalies ({anomaly_ratio*100:.1f}%)")
     print(f"  Types: {dict(pd.Series(anomaly_types).value_counts())}")
-    return data_modified, anomaly_mask
+    return data_modified, anomaly_mask, anomaly_type_map
 
 
 def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedder, config):
@@ -511,10 +516,530 @@ def save_training_plots(train_losses, val_losses, output_dir):
     print(f"✓ Saved training curves")
 
 
+def plot_tsne_embeddings(embeddings_np, ground_truth, fig_dir):
+    """8. t-SNE visualization of learned embeddings - validates representation learning"""
+    from sklearn.manifold import TSNE
+
+    print("  Generating t-SNE embeddings (this may take a moment)...")
+    # Subsample if too many points for speed
+    max_points = 3000
+    if len(embeddings_np) > max_points:
+        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
+        emb_sub = embeddings_np[idx]
+        gt_sub = ground_truth[idx]
+    else:
+        emb_sub = embeddings_np
+        gt_sub = ground_truth
+
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+    reduced = tsne.fit_transform(emb_sub)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    # Plot normal points first (background)
+    normal_mask = gt_sub == 0
+    anomaly_mask = gt_sub == 1
+    ax.scatter(reduced[normal_mask, 0], reduced[normal_mask, 1],
+               c='#06A77D', alpha=0.3, s=10, label=f'Normal ({normal_mask.sum()})')
+    ax.scatter(reduced[anomaly_mask, 0], reduced[anomaly_mask, 1],
+               c='#D62828', alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
+               label=f'Anomaly ({anomaly_mask.sum()})')
+    ax.set_title('t-SNE of Learned Transformer Embeddings', fontsize=15, fontweight='bold')
+    ax.set_xlabel('t-SNE Dimension 1', fontsize=12)
+    ax.set_ylabel('t-SNE Dimension 2', fontsize=12)
+    ax.legend(fontsize=12, loc='best')
+    ax.grid(True, alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/8_tsne_embeddings.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved t-SNE embeddings")
+
+
+def plot_roc_curve(ground_truth, anomaly_scores, fig_dir):
+    """9. ROC Curve with AUC - standard evaluation metric"""
+    from sklearn.metrics import roc_curve, roc_auc_score
+
+    fpr, tpr, _ = roc_curve(ground_truth, anomaly_scores)
+    roc_auc = roc_auc_score(ground_truth, anomaly_scores)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.plot(fpr, tpr, linewidth=3, color='#2E86AB', label=f'ROC Curve (AUC = {roc_auc:.3f})')
+    ax.fill_between(fpr, tpr, alpha=0.2, color='#2E86AB')
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.5, label='Random Classifier')
+    ax.set_xlabel('False Positive Rate', fontsize=13, fontweight='bold')
+    ax.set_ylabel('True Positive Rate', fontsize=13, fontweight='bold')
+    ax.set_title(f'Receiver Operating Characteristic (ROC) Curve', fontsize=15, fontweight='bold')
+    ax.legend(fontsize=12, loc='lower right')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.02])
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/9_roc_curve.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved ROC curve")
+
+
+def plot_component_score_comparison(recon_scores, energy_scores, cluster_scores,
+                                     ground_truth, fig_dir):
+    """10. Per-component score distributions - shows which detector contributes most"""
+    components = [('Reconstruction', recon_scores, '#2E86AB'),
+                  ('Cluster', cluster_scores, '#F18F01')]
+    if energy_scores is not None:
+        components.append(('Energy', energy_scores, '#A23B72'))
+
+    n_cols = len(components)
+    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 5))
+    if n_cols == 1:
+        axes = [axes]
+
+    normal_mask = ground_truth == 0
+    anomaly_mask = ground_truth == 1
+
+    for ax, (name, scores, color) in zip(axes, components):
+        ax.hist(scores[normal_mask], bins=50, alpha=0.6, label='Normal',
+                color='#06A77D', edgecolor='black', linewidth=0.5, density=True)
+        ax.hist(scores[anomaly_mask], bins=50, alpha=0.6, label='Anomaly',
+                color='#D62828', edgecolor='black', linewidth=0.5, density=True)
+        ax.set_title(f'{name} Score Distribution', fontsize=13, fontweight='bold')
+        ax.set_xlabel('Score', fontsize=11)
+        ax.set_ylabel('Density', fontsize=11)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        # Add separation metric
+        if normal_mask.sum() > 0 and anomaly_mask.sum() > 0:
+            nm = scores[normal_mask].mean()
+            am = scores[anomaly_mask].mean()
+            ns = scores[normal_mask].std() + 1e-8
+            sep = (am - nm) / ns
+            ax.text(0.95, 0.95, f"d'={sep:.2f}", transform=ax.transAxes,
+                    fontsize=11, fontweight='bold', ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.8))
+
+    plt.suptitle('Per-Component Anomaly Score Distributions', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/10_component_scores.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved component score comparison")
+
+
+def plot_ablation_study(recon_scores, energy_scores, cluster_scores,
+                        ground_truth, config, fig_dir):
+    """11. Ablation study bar chart - justifies hybrid approach"""
+
+    def compute_best_f1(scores, gt):
+        best_f1 = 0
+        lo, hi = np.percentile(scores, 50), np.percentile(scores, 99.5)
+        for t in np.linspace(lo, hi, 300):
+            pred = scores > t
+            tp = np.sum(pred & (gt == 1))
+            fp = np.sum(pred & (gt == 0))
+            fn = np.sum(~pred & (gt == 1))
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+            if f1 > best_f1:
+                best_f1 = f1
+        return best_f1
+
+    # Normalize each component to [0, 1]
+    def norm01(s):
+        p5, p95 = np.percentile(s, [5, 95])
+        return np.clip((s - p5) / (p95 - p5 + 1e-8), 0, 1)
+
+    results = {}
+    results['Reconstruction\nOnly'] = compute_best_f1(recon_scores, ground_truth)
+    results['Cluster\nOnly'] = compute_best_f1(cluster_scores, ground_truth)
+
+    # Recon + Cluster
+    rc = 0.7 * norm01(recon_scores) + 0.3 * norm01(cluster_scores)
+    results['Recon +\nCluster'] = compute_best_f1(rc, ground_truth)
+
+    if energy_scores is not None:
+        results['Energy\nOnly'] = compute_best_f1(energy_scores, ground_truth)
+
+        # Recon + Energy
+        re = 0.7 * norm01(recon_scores) + 0.3 * norm01(energy_scores)
+        results['Recon +\nEnergy'] = compute_best_f1(re, ground_truth)
+
+        # Full hybrid
+        hybrid = (config.RECON_WEIGHT * norm01(recon_scores) +
+                  config.CLUSTER_WEIGHT * norm01(cluster_scores) +
+                  config.ENERGY_WEIGHT * norm01(energy_scores))
+        results['Full Hybrid\n(Ours)'] = compute_best_f1(hybrid, ground_truth)
+
+    names = list(results.keys())
+    values = list(results.values())
+    colors = ['#A8DADC', '#457B9D', '#1D3557', '#E63946', '#F4A261', '#2A9D8F']
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(names, values, color=colors[:len(names)], edgecolor='black',
+                  linewidth=1.2, alpha=0.85)
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    ax.set_ylabel('Best F1 Score', fontsize=13, fontweight='bold')
+    ax.set_title('Ablation Study: Contribution of Each Component', fontsize=15, fontweight='bold')
+    ax.set_ylim(0, max(values) * 1.2 + 0.05)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='Target F1=0.70')
+    ax.legend(fontsize=11)
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/11_ablation_study.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved ablation study")
+
+
+def plot_per_anomaly_type_detection(anomaly_type_seq, predictions, ground_truth, fig_dir):
+    """12. Per-anomaly-type detection rate - shows model strengths/weaknesses"""
+    if anomaly_type_seq is None or len(anomaly_type_seq) == 0:
+        print("  ⚠️ No anomaly type info available, skipping per-type plot")
+        return
+
+    # Build per-type detection rates
+    type_stats = {}
+    for i in range(len(predictions)):
+        if ground_truth[i] == 1 and i in anomaly_type_seq:
+            atype = anomaly_type_seq[i]
+            if atype not in type_stats:
+                type_stats[atype] = {'total': 0, 'detected': 0}
+            type_stats[atype]['total'] += 1
+            if predictions[i] == 1:
+                type_stats[atype]['detected'] += 1
+
+    if not type_stats:
+        print("  ⚠️ No matched anomaly types in test set, skipping per-type plot")
+        return
+
+    types = sorted(type_stats.keys())
+    rates = [type_stats[t]['detected'] / type_stats[t]['total'] if type_stats[t]['total'] > 0 else 0 for t in types]
+    counts = [type_stats[t]['total'] for t in types]
+
+    colors = ['#264653', '#2A9D8F', '#E9C46A', '#F4A261', '#E76F51', '#606C38']
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(types, rates, color=colors[:len(types)], edgecolor='black',
+                  linewidth=1.2, alpha=0.85)
+
+    for bar, rate, count in zip(bars, rates, counts):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                f'{rate:.1%}\n(n={count})', ha='center', va='bottom',
+                fontsize=10, fontweight='bold')
+
+    ax.set_ylabel('Detection Rate', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Anomaly Type', fontsize=13, fontweight='bold')
+    ax.set_title('Detection Rate by Anomaly Type', fontsize=15, fontweight='bold')
+    ax.set_ylim(0, 1.15)
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='50% baseline')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.xticks(rotation=30, ha='right')
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/12_per_type_detection.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved per-anomaly-type detection rates")
+
+
+def plot_cluster_visualization(embeddings_np, cluster_labels, ground_truth, fig_dir):
+    """13. Cluster visualization with anomaly overlay - validates clustering component"""
+    from sklearn.decomposition import PCA
+
+    # Use PCA for fast 2D projection
+    max_points = 3000
+    if len(embeddings_np) > max_points:
+        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
+        emb_sub = embeddings_np[idx]
+        cl_sub = cluster_labels[idx]
+        gt_sub = ground_truth[idx]
+    else:
+        emb_sub = embeddings_np
+        cl_sub = cluster_labels
+        gt_sub = ground_truth
+
+    pca = PCA(n_components=2, random_state=42)
+    reduced = pca.fit_transform(emb_sub)
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+    # Left: colored by cluster
+    unique_clusters = np.unique(cl_sub)
+    cmap = plt.cm.get_cmap('tab10', len(unique_clusters))
+    for i, cl in enumerate(unique_clusters):
+        mask = cl_sub == cl
+        axes[0].scatter(reduced[mask, 0], reduced[mask, 1], c=[cmap(i)],
+                        alpha=0.5, s=15, label=f'Cluster {cl} ({mask.sum()})')
+    axes[0].set_title('PCA Projection by Cluster Assignment', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
+    axes[0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
+    axes[0].legend(fontsize=8, ncol=2, loc='best')
+    axes[0].grid(True, alpha=0.2)
+
+    # Right: colored by ground truth
+    normal = gt_sub == 0
+    anomaly = gt_sub == 1
+    axes[1].scatter(reduced[normal, 0], reduced[normal, 1], c='#06A77D',
+                    alpha=0.3, s=10, label=f'Normal ({normal.sum()})')
+    axes[1].scatter(reduced[anomaly, 0], reduced[anomaly, 1], c='#D62828',
+                    alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
+                    label=f'Anomaly ({anomaly.sum()})')
+    axes[1].set_title('PCA Projection by Ground Truth', fontsize=14, fontweight='bold')
+    axes[1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
+    axes[1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
+    axes[1].legend(fontsize=11, loc='best')
+    axes[1].grid(True, alpha=0.2)
+
+    plt.suptitle('Cluster Analysis and Anomaly Distribution in Embedding Space',
+                 fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/13_cluster_visualization.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved cluster visualization")
+
+
+def plot_threshold_sensitivity(anomaly_scores, ground_truth, fig_dir):
+    """14. Threshold sensitivity curve - shows operational robustness"""
+    thresholds = np.linspace(np.percentile(anomaly_scores, 10),
+                             np.percentile(anomaly_scores, 99.5), 200)
+    precisions, recalls, f1s = [], [], []
+
+    for t in thresholds:
+        pred = anomaly_scores > t
+        tp = np.sum(pred & (ground_truth == 1))
+        fp = np.sum(pred & (ground_truth == 0))
+        fn = np.sum(~pred & (ground_truth == 1))
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        precisions.append(p)
+        recalls.append(r)
+        f1s.append(f1)
+
+    best_idx = np.argmax(f1s)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(thresholds, precisions, linewidth=2, color='#2E86AB', label='Precision')
+    ax.plot(thresholds, recalls, linewidth=2, color='#A23B72', label='Recall')
+    ax.plot(thresholds, f1s, linewidth=3, color='#F18F01', label='F1 Score')
+
+    # Mark optimal point
+    ax.axvline(x=thresholds[best_idx], color='red', linestyle='--', alpha=0.7,
+               label=f'Optimal θ={thresholds[best_idx]:.3f} (F1={f1s[best_idx]:.3f})')
+    ax.scatter([thresholds[best_idx]], [f1s[best_idx]], s=150, c='red',
+               marker='*', zorder=5, edgecolors='black')
+
+    ax.set_xlabel('Threshold', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Metric Value', fontsize=13, fontweight='bold')
+    ax.set_title('Threshold Sensitivity Analysis', fontsize=15, fontweight='bold')
+    ax.legend(fontsize=11, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1.05)
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/14_threshold_sensitivity.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved threshold sensitivity curve")
+
+
+def plot_reconstruction_error_heatmap(model, test_tensor, ground_truth,
+                                       feature_names, config, fig_dir):
+    """15. Reconstruction error heatmap per feature - validates feature weighting"""
+    model.eval()
+    device = config.DEVICE
+
+    # Get reconstruction errors per feature
+    with torch.no_grad():
+        # Take a manageable subset
+        n_sub = min(500, len(test_tensor))
+        x = test_tensor[:n_sub].to(device)
+        gt = ground_truth[:n_sub]
+
+        encoded = model.encoder(x)
+        reconstructed = model.reconstructor.reconstruction_head(encoded)
+        errors = (x - reconstructed).pow(2).cpu().numpy()  # (N, seq_len, n_features)
+
+    # Average over sequence length
+    errors_per_feature = errors.mean(axis=1)  # (N, n_features)
+
+    normal_errors = errors_per_feature[gt == 0].mean(axis=0)
+    anomaly_errors = errors_per_feature[gt == 1].mean(axis=0) if gt.sum() > 0 else np.zeros(len(feature_names))
+    error_ratio = anomaly_errors / (normal_errors + 1e-8)
+
+    # Sort by error ratio for cleaner visualization
+    sort_idx = np.argsort(error_ratio)[::-1]
+    sorted_features = [feature_names[i] for i in sort_idx]
+    sorted_normal = normal_errors[sort_idx]
+    sorted_anomaly = anomaly_errors[sort_idx]
+    sorted_ratio = error_ratio[sort_idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+
+    # Left: Side-by-side bar chart
+    n_feat = len(sorted_features)
+    y_pos = np.arange(n_feat)
+    axes[0].barh(y_pos - 0.2, sorted_normal, height=0.35, color='#06A77D',
+                 edgecolor='black', linewidth=0.5, label='Normal', alpha=0.8)
+    axes[0].barh(y_pos + 0.2, sorted_anomaly, height=0.35, color='#D62828',
+                 edgecolor='black', linewidth=0.5, label='Anomaly', alpha=0.8)
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(sorted_features, fontsize=9)
+    axes[0].set_xlabel('Mean Reconstruction Error', fontsize=11, fontweight='bold')
+    axes[0].set_title('Reconstruction Error by Feature', fontsize=13, fontweight='bold')
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3, axis='x')
+    axes[0].invert_yaxis()
+
+    # Right: Error ratio (anomaly / normal)
+    bar_colors = ['#D62828' if r > 1.5 else '#F4A261' if r > 1.0 else '#06A77D' for r in sorted_ratio]
+    axes[1].barh(y_pos, sorted_ratio, color=bar_colors, edgecolor='black',
+                 linewidth=0.5, alpha=0.85)
+    axes[1].axvline(x=1.0, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+    axes[1].set_yticks(y_pos)
+    axes[1].set_yticklabels(sorted_features, fontsize=9)
+    axes[1].set_xlabel('Error Ratio (Anomaly / Normal)', fontsize=11, fontweight='bold')
+    axes[1].set_title('Feature Discriminability (Higher = More Discriminative)',
+                      fontsize=13, fontweight='bold')
+    axes[1].grid(True, alpha=0.3, axis='x')
+    axes[1].invert_yaxis()
+
+    plt.suptitle('Reconstruction Error Analysis by Feature', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/15_reconstruction_error_heatmap.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved reconstruction error heatmap")
+
+
+def plot_attention_heatmap(model, test_tensor, ground_truth, config, fig_dir):
+    """16. Attention heatmap - shows what the Transformer focuses on"""
+    model.eval()
+    device = config.DEVICE
+
+    # Register hooks to capture attention weights
+    attention_weights = []
+
+    def hook_fn(module, input, output):
+        # TransformerEncoderLayer uses self-attention internally
+        # output is the layer output, but we need to capture attention from the MHA
+        pass
+
+    # Use a different approach: manually compute attention from the first layer
+    with torch.no_grad():
+        # Pick one normal and one anomaly sample
+        normal_idx = np.where(ground_truth == 0)[0]
+        anomaly_idx = np.where(ground_truth == 1)[0]
+
+        if len(normal_idx) == 0 or len(anomaly_idx) == 0:
+            print("  ⚠️ Need both normal and anomaly samples for attention heatmap")
+            return
+
+        samples = {
+            'Normal': test_tensor[normal_idx[0]:normal_idx[0]+1].to(device),
+            'Anomaly': test_tensor[anomaly_idx[0]:anomaly_idx[0]+1].to(device),
+        }
+
+        fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+        for ax, (label, x) in zip(axes, samples.items()):
+            # Get projected input
+            projected = model.encoder.input_projection(x)
+            projected = model.encoder.pos_encoder(projected)
+
+            # Get attention weights from first transformer layer
+            layer = model.encoder.transformer_encoder.layers[0]
+            # Self-attention: Q, K, V from the same input
+            # Use the multihead attention module directly
+            src = layer.norm1(projected)  # Pre-norm
+            attn_output, attn_weights = layer.self_attn(
+                src, src, src, need_weights=True, average_attn_weights=True
+            )
+            # attn_weights shape: (1, seq_len, seq_len)
+            attn = attn_weights[0].cpu().numpy()  # (seq_len, seq_len)
+
+            import seaborn as sns
+            sns.heatmap(attn, cmap='viridis', ax=ax, square=False,
+                        cbar_kws={'label': 'Attention Weight', 'shrink': 0.8})
+            ax.set_title(f'Self-Attention ({label} Sample)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Key Position (Time Step)', fontsize=11)
+            ax.set_ylabel('Query Position (Time Step)', fontsize=11)
+
+            # Show every 10th tick
+            tick_positions = list(range(0, attn.shape[0], 10))
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_positions, fontsize=8)
+            ax.set_yticks(tick_positions)
+            ax.set_yticklabels(tick_positions, fontsize=8)
+
+        plt.suptitle('Transformer Self-Attention Patterns', fontsize=15, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f"{fig_dir}/16_attention_heatmap.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  ✓ Saved attention heatmap")
+
+
+def plot_energy_score_landscape(embeddings_np, energy_scores, ground_truth, fig_dir):
+    """17. Energy score landscape - validates energy detector learning"""
+    if energy_scores is None:
+        print("  ⚠️ No energy scores, skipping energy landscape")
+        return
+
+    from sklearn.decomposition import PCA
+
+    max_points = 3000
+    if len(embeddings_np) > max_points:
+        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
+        emb_sub = embeddings_np[idx]
+        es_sub = energy_scores[idx]
+        gt_sub = ground_truth[idx]
+    else:
+        emb_sub = embeddings_np
+        es_sub = energy_scores
+        gt_sub = ground_truth
+
+    pca = PCA(n_components=2, random_state=42)
+    reduced = pca.fit_transform(emb_sub)
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+    # Left: colored by energy score
+    sc = axes[0].scatter(reduced[:, 0], reduced[:, 1], c=es_sub, cmap='RdYlGn_r',
+                         s=15, alpha=0.6, edgecolors='none')
+    plt.colorbar(sc, ax=axes[0], label='Energy Score', shrink=0.8)
+    axes[0].set_title('Energy Score Distribution in Embedding Space',
+                      fontsize=13, fontweight='bold')
+    axes[0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
+    axes[0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
+    axes[0].grid(True, alpha=0.2)
+
+    # Right: ground truth overlay with energy contour
+    normal = gt_sub == 0
+    anomaly = gt_sub == 1
+    axes[1].scatter(reduced[normal, 0], reduced[normal, 1], c='#06A77D',
+                    alpha=0.3, s=10, label=f'Normal')
+    axes[1].scatter(reduced[anomaly, 0], reduced[anomaly, 1], c='#D62828',
+                    alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
+                    label=f'Anomaly')
+    axes[1].set_title('Ground Truth with Energy Score Overlay',
+                      fontsize=13, fontweight='bold')
+    axes[1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
+    axes[1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
+    axes[1].legend(fontsize=11, loc='best')
+    axes[1].grid(True, alpha=0.2)
+
+    plt.suptitle('Energy-Based Anomaly Detection Landscape', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f"{fig_dir}/17_energy_landscape.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✓ Saved energy score landscape")
+
+
 def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
                                   train_reconstruction, anomaly_scores, predictions,
                                   ground_truth, tp, fp, fn, tn, precision, recall,
-                                  f1, accuracy, output_dir):
+                                  f1, accuracy, output_dir,
+                                  embeddings_np=None, cluster_labels=None,
+                                  recon_scores=None, energy_scores=None,
+                                  cluster_scores=None, anomaly_type_seq=None,
+                                  model=None, test_tensor=None, feature_names=None,
+                                  config=None):
     """
     Generate comprehensive visualizations for thesis
     """
@@ -779,7 +1304,96 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     plt.close()
     print(f"  ✓ Saved results dashboard")
 
-    print(f"\n✓ All {7} thesis-ready visualizations saved to {fig_dir}/")
+    # ========================================================================
+    # NEW THESIS VISUALIZATIONS (8-17)
+    # ========================================================================
+    n_plots = 7
+
+    # 8. t-SNE Embeddings
+    if embeddings_np is not None:
+        try:
+            plot_tsne_embeddings(embeddings_np, ground_truth, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ t-SNE plot failed: {e}")
+
+    # 9. ROC Curve
+    try:
+        plot_roc_curve(ground_truth, anomaly_scores, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ ROC curve failed: {e}")
+
+    # 10. Component Score Comparison
+    if recon_scores is not None and cluster_scores is not None:
+        try:
+            plot_component_score_comparison(recon_scores, energy_scores,
+                                           cluster_scores, ground_truth, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Component score plot failed: {e}")
+
+    # 11. Ablation Study
+    if recon_scores is not None and cluster_scores is not None and config is not None:
+        try:
+            plot_ablation_study(recon_scores, energy_scores, cluster_scores,
+                                ground_truth, config, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Ablation study failed: {e}")
+
+    # 12. Per-Anomaly-Type Detection Rate
+    if anomaly_type_seq is not None:
+        try:
+            plot_per_anomaly_type_detection(anomaly_type_seq, predictions,
+                                            ground_truth, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Per-type detection plot failed: {e}")
+
+    # 13. Cluster Visualization
+    if embeddings_np is not None and cluster_labels is not None:
+        try:
+            plot_cluster_visualization(embeddings_np, cluster_labels,
+                                       ground_truth, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Cluster visualization failed: {e}")
+
+    # 14. Threshold Sensitivity
+    try:
+        plot_threshold_sensitivity(anomaly_scores, ground_truth, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Threshold sensitivity plot failed: {e}")
+
+    # 15. Reconstruction Error Heatmap
+    if model is not None and test_tensor is not None and feature_names is not None and config is not None:
+        try:
+            plot_reconstruction_error_heatmap(model, test_tensor, ground_truth,
+                                              feature_names, config, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Reconstruction error heatmap failed: {e}")
+
+    # 16. Attention Heatmap
+    if model is not None and test_tensor is not None and config is not None:
+        try:
+            plot_attention_heatmap(model, test_tensor, ground_truth, config, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Attention heatmap failed: {e}")
+
+    # 17. Energy Score Landscape
+    if embeddings_np is not None and energy_scores is not None:
+        try:
+            plot_energy_score_landscape(embeddings_np, energy_scores,
+                                        ground_truth, fig_dir)
+            n_plots += 1
+        except Exception as e:
+            print(f"  ⚠️ Energy landscape failed: {e}")
+
+    print(f"\n✓ All {n_plots} thesis-ready visualizations saved to {fig_dir}/")
     return fig_dir
 
 
@@ -808,7 +1422,7 @@ def main():
     print(f"Loaded {len(df)} rows")
 
     # Inject diverse anomalies
-    df_with_anomalies, ground_truth = inject_diverse_anomalies(
+    df_with_anomalies, ground_truth, anomaly_type_map = inject_diverse_anomalies(
         df,
         anomaly_ratio=ImprovedConfig.ANOMALY_RATIO,
         intensity=ImprovedConfig.ANOMALY_INTENSITY
@@ -845,6 +1459,15 @@ def main():
 
     print(f"  Ground truth alignment: {surviving_indices.shape[0]} surviving rows, "
           f"{ground_truth_aligned.sum()} anomalous sequences ({ground_truth_aligned.sum()/len(ground_truth_aligned)*100:.1f}%)")
+
+    # Align anomaly type map to sequence indices (last-point labeling)
+    anomaly_type_seq = {}
+    for i in range(n_sequences):
+        last_idx = i + ImprovedConfig.WINDOW_SIZE - 1
+        if last_idx < len(surviving_indices):
+            original_idx = surviving_indices[last_idx]
+            if original_idx in anomaly_type_map:
+                anomaly_type_seq[i] = anomaly_type_map[original_idx]
 
     # Split
     n_samples = len(sequences)
@@ -1231,10 +1854,28 @@ def main():
     print("GENERATING VISUALIZATIONS FOR THESIS")
     print("="*80)
 
+    # Build test-set anomaly type map (re-index from global to test-local indices)
+    test_start_idx = n_train + n_val
+    test_anomaly_type_seq = {}
+    for global_idx, atype in anomaly_type_seq.items():
+        local_idx = global_idx - test_start_idx
+        if 0 <= local_idx < len(test_gt):
+            test_anomaly_type_seq[local_idx] = atype
+
     generate_thesis_visualizations(
         train_losses, val_losses, train_contrastive, train_reconstruction,
         final_scores, predictions, test_gt, tp, fp, fn, tn,
-        precision, recall, f1, accuracy, output_dir
+        precision, recall, f1, accuracy, output_dir,
+        embeddings_np=embeddings_np,
+        cluster_labels=test_cluster_labels,
+        recon_scores=recon_scores,
+        energy_scores=energy_scores,
+        cluster_scores=cluster_scores,
+        anomaly_type_seq=test_anomaly_type_seq,
+        model=model,
+        test_tensor=test_tensor,
+        feature_names=feature_names,
+        config=ImprovedConfig
     )
 
     # ========================================================================
