@@ -68,8 +68,8 @@ class ImprovedConfig:
 
     # Energy detector - More training with better hyperparameters
     USE_ENERGY_DETECTOR = True
-    ENERGY_EPOCHS = 80  # Extended training for better convergence
-    ENERGY_LR = 1e-4  # Higher LR for faster convergence
+    ENERGY_EPOCHS = 100  # More epochs with clipped data for better convergence
+    ENERGY_LR = 3e-4  # Higher LR with clipped data (more stable gradients)
     ENERGY_GRADIENT_CLIP = 0.5
     ENERGY_WEIGHT_DECAY = 1e-5  # Less weight decay for energy detector
 
@@ -77,14 +77,14 @@ class ImprovedConfig:
     N_CLUSTERS = 8  # Reduced for clearer separation
     MIN_CLUSTER_SIZE = 100  # Require larger clusters
 
-    # Hybrid Detection - Reconstruction dominates (trained on normals only)
+    # Hybrid Detection - Reconstruction + Energy (cluster has negative d', disabled)
     USE_HYBRID = True
-    ENERGY_WEIGHT = 0.15  # Energy detector weight (important for thesis)
-    RECON_WEIGHT = 0.70   # Reconstruction weight (strongest - normal-only training)
-    CLUSTER_WEIGHT = 0.15 # Cluster-based anomaly scoring weight
+    ENERGY_WEIGHT = 0.25  # Energy detector (d'=0.32, useful complement)
+    RECON_WEIGHT = 0.75   # Reconstruction (d'=0.72, strongest signal)
+    CLUSTER_WEIGHT = 0.00 # DISABLED - cluster d' was -0.28, hurting detection
 
     # Precision constraint for threshold tuning
-    MIN_PRECISION = 0.30  # Require higher precision to reduce false positives
+    MIN_PRECISION = 0.20  # Lower to allow better recall (precision was 0.70, room to trade)
 
     # Anomaly Injection - STRONG intensity so anomalies survive scaling
     ANOMALY_RATIO = 0.07  # 7% anomalies for sufficient training signal
@@ -104,7 +104,7 @@ class ImprovedConfig:
     # System
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     OUTPUT_DIR = 'improved_outputs'
-    EARLY_STOPPING_PATIENCE = 20  # Faster convergence on normal-only data
+    EARLY_STOPPING_PATIENCE = 30  # Allow more patience with higher regularization
 
     # Reporting
     SAVE_PLOTS = True
@@ -307,7 +307,7 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 anomaly_energy = torch.clamp(anomaly_energy, -10, 10)
 
                 # Margin loss: anomaly energy should be at least `margin` higher than normal
-                margin = 3.0
+                margin = 5.0
                 margin_loss = torch.relu(margin + normal_energy.mean() - anomaly_energy.mean())
 
                 # Push normal energies low, anomaly energies high
@@ -321,7 +321,7 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 # L2 regularization
                 reg_loss = 0.001 * (energies ** 2).mean()
 
-                loss = margin_loss + 0.3 * normal_push + 0.3 * anomaly_push + 0.5 * bce_loss + reg_loss
+                loss = margin_loss + 0.3 * normal_push + 0.3 * anomaly_push + 1.0 * bce_loss + reg_loss
             elif is_normal.sum() > 0:
                 # Only normal samples in this batch
                 loss = torch.relu(energies[is_normal]).mean() + 0.001 * (energies ** 2).mean()
@@ -356,10 +356,11 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
     return True
 
 
-def _find_best_threshold_for_component(scores, gt, name, n_steps=300):
+def _find_best_threshold_for_component(scores, gt, name, n_steps=500):
     """Find the threshold that maximises F1 for a single score vector."""
     best_f1, best_t, best_m = 0, np.median(scores), {'p': 0, 'r': 0, 'f1': 0}
-    lo, hi = np.percentile(scores, 50), np.percentile(scores, 99.9)
+    # Search from percentile 20 to catch lower thresholds that improve recall
+    lo, hi = np.percentile(scores, 20), np.percentile(scores, 99.9)
     for t in np.linspace(lo, hi, n_steps):
         pred = scores > t
         tp = np.sum(pred & (gt == 1))
@@ -1467,6 +1468,14 @@ def main():
     )
 
     sequences, feature_names = preprocessor.prepare_data(df_with_anomalies, fit_scaler=True)
+
+    # Clip scaled data to [-10, 10] to prevent extreme anomaly values from
+    # destabilizing training. Anomalies will be at ±10 (clearly outliers)
+    # while normals stay around ±2. Without clipping, ranges like [-153, 187]
+    # make reconstruction loss huge and unstable.
+    clip_val = 10.0
+    sequences = np.clip(sequences, -clip_val, clip_val)
+    print(f"✓ Clipped scaled sequences to [{-clip_val}, {clip_val}]")
     print(f"✓ Created {len(sequences)} sequences with {len(feature_names)} features")
 
     # ---- CRITICAL: Align ground truth with surviving indices ----
