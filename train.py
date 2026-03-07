@@ -84,10 +84,10 @@ class ImprovedConfig:
     CLUSTER_WEIGHT = 0.00 # DISABLED - cluster d' was -0.28, hurting detection
 
     # Precision constraint for threshold tuning
-    MIN_PRECISION = 0.20  # Lower to allow better recall (precision was 0.70, room to trade)
+    MIN_PRECISION = 0.40  # Require reasonable precision to avoid excessive false positives
 
     # Anomaly Injection - STRONG intensity so anomalies survive scaling
-    ANOMALY_RATIO = 0.07  # 7% anomalies for sufficient training signal
+    ANOMALY_RATIO = 0.05  # 5% anomalies (×3 timesteps → ~15% sequence rate)
     ANOMALY_INTENSITY = 10.0  # Strong - must survive RobustScaler + normalization
     ANOMALY_WINDOW = 3  # Affect 3 consecutive timesteps per anomaly
 
@@ -356,11 +356,10 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
     return True
 
 
-def _find_best_threshold_for_component(scores, gt, name, n_steps=500):
+def _find_best_threshold_for_component(scores, gt, name, n_steps=500, min_precision=0.0):
     """Find the threshold that maximises F1 for a single score vector."""
     best_f1, best_t, best_m = 0, np.median(scores), {'p': 0, 'r': 0, 'f1': 0}
-    # Search from percentile 20 to catch lower thresholds that improve recall
-    lo, hi = np.percentile(scores, 20), np.percentile(scores, 99.9)
+    lo, hi = np.percentile(scores, 40), np.percentile(scores, 99.9)
     for t in np.linspace(lo, hi, n_steps):
         pred = scores > t
         tp = np.sum(pred & (gt == 1))
@@ -369,7 +368,7 @@ def _find_best_threshold_for_component(scores, gt, name, n_steps=500):
         p = tp / (tp + fp) if (tp + fp) > 0 else 0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-        if f1 > best_f1:
+        if f1 > best_f1 and p >= min_precision:
             best_f1 = f1
             best_t = t
             best_m = {'p': p, 'r': r, 'f1': f1}
@@ -477,7 +476,7 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         r = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
 
-        if f1 > best_f1:
+        if f1 > best_f1 and p >= config.MIN_PRECISION:
             best_f1 = f1
             best_thresholds = dict(zip(comp_names, thrs))
             best_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
@@ -491,7 +490,9 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     if energy_scores is not None:
         energy_p5, energy_p95 = np.percentile(energy_scores, [5, 95])
         energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
-        ws = config.RECON_WEIGHT * recon_norm + config.CLUSTER_WEIGHT * cluster_norm + config.ENERGY_WEIGHT * energy_norm
+        # Normalize weights to sum to 1.0 (skip zero-weight components)
+        total_w = config.RECON_WEIGHT + config.CLUSTER_WEIGHT + config.ENERGY_WEIGHT
+        ws = (config.RECON_WEIGHT/total_w) * recon_norm + (config.CLUSTER_WEIGHT/total_w) * cluster_norm + (config.ENERGY_WEIGHT/total_w) * energy_norm
     else:
         energy_p5, energy_p95 = 0, 1
         energy_norm = np.zeros_like(recon_norm)
@@ -500,22 +501,37 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     combined_scores = ws  # For return / visualizations
 
     # Single-threshold search on weighted sum
-    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum')
+    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum', min_precision=config.MIN_PRECISION)
+
+    # Also try recon-only (often strongest when other components have low d')
+    recon_t, recon_m = _find_best_threshold_for_component(recon_norm, val_gt, 'recon_only', min_precision=config.MIN_PRECISION)
+
     print(f"\n  OR-ensemble best:   F1={best_metrics['f1']:.3f}  P={best_metrics['precision']:.3f}  R={best_metrics['recall']:.3f}")
     print(f"  Weighted-sum best:  F1={ws_m['f1']:.3f}  P={ws_m['p']:.3f}  R={ws_m['r']:.3f}")
+    print(f"  Recon-only best:    F1={recon_m['f1']:.3f}  P={recon_m['p']:.3f}  R={recon_m['r']:.3f}")
 
-    # Pick whichever strategy won
-    use_or_ensemble = best_metrics['f1'] >= ws_m['f1']
-    if use_or_ensemble:
-        print(f"  → Using OR-ensemble (better F1)")
+    # Pick whichever strategy has the best F1
+    candidates = [
+        ('or_ensemble', best_metrics['f1'], best_metrics, best_thresholds, True),
+        ('weighted_sum', ws_m['f1'], {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}, {'combined': ws_t}, False),
+        ('recon_only', recon_m['f1'], {'precision': recon_m['p'], 'recall': recon_m['r'], 'f1': recon_m['f1']}, {'combined': recon_t, 'recon_only': True}, False),
+    ]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    winner_name, _, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
+
+    if winner_is_or:
+        print(f"  → Using OR-ensemble (best F1)")
         for n in comp_names:
-            print(f"    {n} threshold = {best_thresholds[n]:.4f}")
+            print(f"    {n} threshold = {winner_thresholds[n]:.4f}")
+        use_or_ensemble = True
     else:
-        print(f"  → Using weighted-sum (better F1)")
-        best_metrics = {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}
-        # Store weighted-sum threshold as a single 'combined' threshold
-        best_thresholds = {'combined': ws_t}
-        combined_scores = ws
+        print(f"  → Using {winner_name} (best F1)")
+        use_or_ensemble = False
+        if winner_name == 'recon_only':
+            combined_scores = recon_norm
+
+    best_metrics = winner_metrics
+    best_thresholds = winner_thresholds
 
     print(f"\n✓ Best Val F1: {best_metrics['f1']:.3f}, Precision: {best_metrics['precision']:.3f}, Recall: {best_metrics['recall']:.3f}")
 
@@ -1790,6 +1806,7 @@ def main():
     # ---- Determine predictions using same strategy as validation ----
     use_or = val_norm_stats.get('use_or_ensemble', False)
     comp_thresholds = val_norm_stats.get('comp_thresholds', {})
+    is_recon_only = comp_thresholds.get('recon_only', False)
 
     if use_or:
         # OR-ensemble: anomalous if ANY component exceeds its threshold
@@ -1810,8 +1827,16 @@ def main():
         ] + ([
             (energy_scores - energy_scores.mean()) / (energy_scores.std() + 1e-8)
         ] if energy_scores is not None else []))
+    elif is_recon_only:
+        # Recon-only: use normalized reconstruction scores with recon threshold
+        recon_p5 = val_norm_stats['recon_p5']
+        recon_p95 = val_norm_stats['recon_p95']
+        recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
+        final_scores = recon_norm
+        predictions = final_scores > best_threshold
+        detection_method = "Reconstruction-Only (strongest d' component)"
     else:
-        # Weighted-sum with single threshold (fallback)
+        # Weighted-sum with single threshold
         recon_p5 = val_norm_stats['recon_p5']
         recon_p95 = val_norm_stats['recon_p95']
         cluster_p5 = val_norm_stats['cluster_p5']
@@ -1824,10 +1849,11 @@ def main():
             energy_p5 = val_norm_stats['energy_p5']
             energy_p95 = val_norm_stats['energy_p95']
             energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
-            final_scores = (ImprovedConfig.RECON_WEIGHT * recon_norm +
-                           ImprovedConfig.CLUSTER_WEIGHT * cluster_norm +
-                           ImprovedConfig.ENERGY_WEIGHT * energy_norm)
-            detection_method = "Hybrid (Reconstruction + Cluster + Energy)"
+            total_w = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT + ImprovedConfig.ENERGY_WEIGHT
+            final_scores = ((ImprovedConfig.RECON_WEIGHT/total_w) * recon_norm +
+                           (ImprovedConfig.CLUSTER_WEIGHT/total_w) * cluster_norm +
+                           (ImprovedConfig.ENERGY_WEIGHT/total_w) * energy_norm)
+            detection_method = "Hybrid (Reconstruction + Energy)"
         else:
             tw = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT
             final_scores = ((ImprovedConfig.RECON_WEIGHT / tw) * recon_norm +
