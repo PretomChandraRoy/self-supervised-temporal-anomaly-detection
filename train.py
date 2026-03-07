@@ -48,18 +48,18 @@ class ImprovedConfig:
     VAL_RATIO = 0.15
     TEST_RATIO = 0.15
 
-    # Model Architecture - Right-sized to avoid memorizing anomalies
-    D_MODEL = 128  # Smaller to prevent memorization
-    N_HEADS = 8
-    N_LAYERS = 4  # Fewer layers
-    DROPOUT = 0.15
-    MASK_RATIO = 0.30  # Higher mask ratio forces learning from context
+    # Model Architecture - Small to prevent overfitting on ~14k samples
+    D_MODEL = 64   # Smaller → less memorization, better generalization
+    N_HEADS = 4
+    N_LAYERS = 2   # 2 layers sufficient for 60-step sequences
+    DROPOUT = 0.25  # Higher dropout for regularization
+    MASK_RATIO = 0.40  # Higher mask ratio forces learning structure, not memorizing
 
     # Training - Extended with better convergence
     N_EPOCHS = 150  # More epochs for better convergence
     BATCH_SIZE = 64  # Larger batch for stability
-    LEARNING_RATE = 5e-4  # Higher LR since model is smaller
-    WEIGHT_DECAY = 1e-4  # Stronger regularization
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-3  # Stronger regularization to close train/val gap
     GRADIENT_CLIP = 1.0  # Standard clipping
 
     # Loss weights - Reconstruction-focused for anomaly detection
@@ -86,9 +86,10 @@ class ImprovedConfig:
     # Precision constraint for threshold tuning
     MIN_PRECISION = 0.30  # Require higher precision to reduce false positives
 
-    # Anomaly Injection - Moderate intensity for realistic anomalies
+    # Anomaly Injection - STRONG intensity so anomalies survive scaling
     ANOMALY_RATIO = 0.07  # 7% anomalies for sufficient training signal
-    ANOMALY_INTENSITY = 2.5  # Moderate - strong enough to detect, not unrealistic
+    ANOMALY_INTENSITY = 10.0  # Strong - must survive RobustScaler + normalization
+    ANOMALY_WINDOW = 3  # Affect 3 consecutive timesteps per anomaly
 
     # Threshold Tuning - More granular search at higher percentiles
     USE_VALIDATION_TUNING = True
@@ -112,10 +113,13 @@ class ImprovedConfig:
 
 def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
     """
-    Inject diverse, realistic financial anomalies with STRONG signals
+    Inject diverse, realistic financial anomalies with STRONG signals.
+    Each anomaly affects ANOMALY_WINDOW consecutive timesteps so the signal
+    survives windowing (60-step windows with last-point labeling).
     """
     n_samples = len(data)
     n_anomalies = int(n_samples * anomaly_ratio)
+    anomaly_window = getattr(ImprovedConfig, 'ANOMALY_WINDOW', 3)
 
     price_std = data['close'].std()
     volume_std = data['tick_volume'].std()
@@ -130,11 +134,24 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
     if 'tick_volume' in data_modified.columns:
         data_modified['tick_volume'] = data_modified['tick_volume'].astype(float)
 
-    safe_indices = np.arange(ImprovedConfig.WINDOW_SIZE, n_samples - ImprovedConfig.WINDOW_SIZE)
+    # Ensure anomalies don't overlap: space them at least anomaly_window apart
+    safe_indices = np.arange(ImprovedConfig.WINDOW_SIZE, n_samples - ImprovedConfig.WINDOW_SIZE - anomaly_window)
     if len(safe_indices) < n_anomalies:
         n_anomalies = len(safe_indices) // 2
 
-    anomaly_indices = np.random.choice(safe_indices, n_anomalies, replace=False)
+    # Select non-overlapping indices
+    all_candidates = np.random.permutation(safe_indices)
+    anomaly_indices = []
+    used = set()
+    for idx in all_candidates:
+        if len(anomaly_indices) >= n_anomalies:
+            break
+        # Check no overlap with existing anomalies
+        if any(abs(idx - u) < anomaly_window + 1 for u in used):
+            continue
+        anomaly_indices.append(idx)
+        used.add(idx)
+    anomaly_indices = np.array(anomaly_indices)
 
     anomaly_types = []
     for idx in anomaly_indices:
@@ -148,74 +165,87 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
         # Use local volatility for context-aware anomalies
         local_std = rolling_std.iloc[idx] if not np.isnan(rolling_std.iloc[idx]) else price_std
 
-        if anomaly_type == 'price_spike':
-            # Strong sudden price jump (use higher multiplier)
-            multiplier = np.random.uniform(intensity, intensity + 2.0)
-            direction = np.random.choice([-1, 1])
-            spike = local_std * multiplier * direction
+        # Apply anomaly to a window of consecutive timesteps
+        for offset in range(anomaly_window):
+            t = idx + offset
+            if t >= n_samples:
+                break
 
-            data_modified.iloc[idx, data_modified.columns.get_loc('close')] += spike
-            data_modified.iloc[idx, data_modified.columns.get_loc('high')] = max(
-                data_modified.iloc[idx]['high'],
-                data_modified.iloc[idx]['close'] + abs(spike) * 0.3
-            )
-            data_modified.iloc[idx, data_modified.columns.get_loc('low')] = min(
-                data_modified.iloc[idx]['low'],
-                data_modified.iloc[idx]['close'] - abs(spike) * 0.3
-            )
+            # Scale intensity slightly for each timestep in the window
+            t_intensity = intensity * (1.0 - 0.2 * offset)  # Decay slightly
 
-        elif anomaly_type == 'volatility_spike':
-            # Extreme volatility (much larger range)
-            multiplier = np.random.uniform(intensity + 1.0, intensity + 3.0)
-            base_range = data_modified.iloc[idx]['high'] - data_modified.iloc[idx]['low']
-            new_range = base_range * multiplier
+            if anomaly_type == 'price_spike':
+                # Strong sudden price jump
+                multiplier = np.random.uniform(t_intensity, t_intensity + 3.0)
+                direction = np.random.choice([-1, 1])
+                spike = local_std * multiplier * direction
 
-            mid = (data_modified.iloc[idx]['high'] + data_modified.iloc[idx]['low']) / 2
-            data_modified.iloc[idx, data_modified.columns.get_loc('high')] = mid + new_range / 2
-            data_modified.iloc[idx, data_modified.columns.get_loc('low')] = mid - new_range / 2
-
-        elif anomaly_type == 'volume_spike':
-            # Very unusual volume
-            multiplier = np.random.uniform(intensity + 3.0, intensity + 8.0)
-            data_modified.iloc[idx, data_modified.columns.get_loc('tick_volume')] *= multiplier
-
-        elif anomaly_type == 'trend_break':
-            # Strong sudden reversal affecting multiple bars
-            window_start = max(0, idx-5)
-            mean_price = data_modified.iloc[window_start:idx]['close'].mean()
-            deviation = local_std * intensity * 1.5
-            new_price = mean_price + deviation if np.random.rand() > 0.5 else mean_price - deviation
-            data_modified.iloc[idx, data_modified.columns.get_loc('close')] = new_price
-            data_modified.iloc[idx, data_modified.columns.get_loc('open')] = mean_price
-
-        elif anomaly_type == 'flash_crash':
-            # Quick severe drop and partial recovery
-            crash_depth = local_std * intensity * 2.0
-            data_modified.iloc[idx, data_modified.columns.get_loc('low')] -= crash_depth
-            data_modified.iloc[idx, data_modified.columns.get_loc('close')] -= crash_depth * 0.7
-            data_modified.iloc[idx, data_modified.columns.get_loc('open')] -= crash_depth * 0.2
-
-        elif anomaly_type == 'gap_anomaly':
-            # Gap up/down from previous close
-            if idx > 0:
-                prev_close = data_modified.iloc[idx-1]['close']
-                gap = local_std * intensity * np.random.choice([-1, 1])
-                data_modified.iloc[idx, data_modified.columns.get_loc('open')] = prev_close + gap
-                data_modified.iloc[idx, data_modified.columns.get_loc('high')] = max(
-                    data_modified.iloc[idx]['high'], prev_close + gap
+                data_modified.iloc[t, data_modified.columns.get_loc('close')] += spike
+                data_modified.iloc[t, data_modified.columns.get_loc('high')] = max(
+                    data_modified.iloc[t]['high'],
+                    data_modified.iloc[t]['close'] + abs(spike) * 0.3
                 )
-                data_modified.iloc[idx, data_modified.columns.get_loc('low')] = min(
-                    data_modified.iloc[idx]['low'], prev_close + gap
+                data_modified.iloc[t, data_modified.columns.get_loc('low')] = min(
+                    data_modified.iloc[t]['low'],
+                    data_modified.iloc[t]['close'] - abs(spike) * 0.3
                 )
 
-        anomaly_mask[idx] = True
+            elif anomaly_type == 'volatility_spike':
+                # Extreme volatility (much larger range)
+                multiplier = np.random.uniform(t_intensity + 2.0, t_intensity + 5.0)
+                base_range = data_modified.iloc[t]['high'] - data_modified.iloc[t]['low']
+                new_range = base_range * multiplier
+
+                mid = (data_modified.iloc[t]['high'] + data_modified.iloc[t]['low']) / 2
+                data_modified.iloc[t, data_modified.columns.get_loc('high')] = mid + new_range / 2
+                data_modified.iloc[t, data_modified.columns.get_loc('low')] = mid - new_range / 2
+
+            elif anomaly_type == 'volume_spike':
+                # Very unusual volume
+                multiplier = np.random.uniform(t_intensity + 5.0, t_intensity + 15.0)
+                data_modified.iloc[t, data_modified.columns.get_loc('tick_volume')] *= multiplier
+
+            elif anomaly_type == 'trend_break':
+                # Strong sudden reversal
+                window_start = max(0, t-5)
+                mean_price = data_modified.iloc[window_start:t]['close'].mean()
+                deviation = local_std * t_intensity * 2.0
+                new_price = mean_price + deviation if np.random.rand() > 0.5 else mean_price - deviation
+                data_modified.iloc[t, data_modified.columns.get_loc('close')] = new_price
+                data_modified.iloc[t, data_modified.columns.get_loc('open')] = mean_price
+
+            elif anomaly_type == 'flash_crash':
+                # Quick severe drop and partial recovery
+                crash_depth = local_std * t_intensity * 3.0
+                data_modified.iloc[t, data_modified.columns.get_loc('low')] -= crash_depth
+                data_modified.iloc[t, data_modified.columns.get_loc('close')] -= crash_depth * 0.7
+                data_modified.iloc[t, data_modified.columns.get_loc('open')] -= crash_depth * 0.2
+
+            elif anomaly_type == 'gap_anomaly':
+                # Gap up/down from previous close
+                if t > 0:
+                    prev_close = data_modified.iloc[t-1]['close']
+                    gap = local_std * t_intensity * 1.5 * np.random.choice([-1, 1])
+                    data_modified.iloc[t, data_modified.columns.get_loc('open')] = prev_close + gap
+                    data_modified.iloc[t, data_modified.columns.get_loc('high')] = max(
+                        data_modified.iloc[t]['high'], prev_close + gap
+                    )
+                    data_modified.iloc[t, data_modified.columns.get_loc('low')] = min(
+                        data_modified.iloc[t]['low'], prev_close + gap
+                    )
+
+            anomaly_mask[t] = True
 
     # Build per-sample anomaly type map (index -> type string)
     anomaly_type_map = {}
     for idx, atype in zip(anomaly_indices, anomaly_types):
-        anomaly_type_map[idx] = atype
+        for offset in range(anomaly_window):
+            t = idx + offset
+            if t < n_samples:
+                anomaly_type_map[t] = atype
 
-    print(f"✓ Injected {n_anomalies} diverse anomalies ({anomaly_ratio*100:.1f}%)")
+    print(f"✓ Injected {len(anomaly_indices)} diverse anomalies ({anomaly_ratio*100:.1f}%)")
+    print(f"  Each affects {anomaly_window} consecutive timesteps → {anomaly_mask.sum()} anomalous points")
     print(f"  Types: {dict(pd.Series(anomaly_types).value_counts())}")
     return data_modified, anomaly_mask, anomaly_type_map
 
@@ -1657,15 +1687,19 @@ def main():
     # ========================================================================
     print("\n[5/8] Fitting reconstruction detector...")
 
-    # Build feature weights: emphasize price-sensitive features that anomalies affect
+    # Build feature weights: emphasize price-sensitive features, ZERO-weight slow indicators
+    # Slow indicators (SMA, EMA, Bollinger, ADX) barely change from point anomalies
+    # and add noise that dilutes the discriminative reconstruction error signal
     price_sensitive = {'close', 'open', 'high', 'low', 'returns', 'log_returns',
                        'high_low_range', 'close_open_range', 'atr', 'atr_pct'}
+    slow_indicators = {'sma_20', 'sma_50', 'ema_12', 'ema_26', 'adx',
+                       'bb_high', 'bb_low', 'bb_position'}
     feature_weights = []
     for fname in feature_names:
         if fname.lower() in price_sensitive:
             feature_weights.append(3.0)
-        elif any(slow in fname.lower() for slow in ['sma', 'ema', 'adx', 'bb_']):
-            feature_weights.append(0.5)
+        elif fname.lower() in slow_indicators:
+            feature_weights.append(0.0)  # Zero weight - these dilute signal
         else:
             feature_weights.append(1.0)
     feature_weights_tensor = torch.FloatTensor(feature_weights)

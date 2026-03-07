@@ -205,18 +205,18 @@ class ReconstructionBasedDetector:
     def fit(self, x):
         """
         Fit detector on normal data to establish threshold.
-        Uses the same bottleneck approach as predict().
+        Uses the SAME pathway as training: encode → reconstruct directly
+        (no bottleneck). The reconstruction head was trained on per-timestep
+        encoder outputs, so we must use that same pathway at inference.
         Args:
             x: (n_samples, seq_len, n_features) normal training data
         """
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Encode and bottleneck (same as predict)
-            encoder_output = self.reconstructor.encoder(x)
-            bottleneck = encoder_output.mean(dim=1, keepdim=True)
-            bottleneck_expanded = bottleneck.expand_as(encoder_output)
-            reconstructed = self.reconstructor.reconstruction_head(bottleneck_expanded)
+            # Use the same pathway as training: encode → reconstruct per-timestep
+            encoder_output = self.reconstructor.encoder(x)  # (B, L, d_model)
+            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
 
             if self.use_mahalanobis:
                 # Fit covariance on residuals
@@ -254,10 +254,11 @@ class ReconstructionBasedDetector:
     def predict(self, x):
         """
         Predict anomaly scores based on reconstruction error.
-        Uses a BOTTLENECK approach: the encoder output is mean-pooled
-        into a single vector and then expanded back to seq_len, forcing
-        information loss.  This means anomalous timesteps cannot be
-        trivially copied through, producing higher reconstruction error.
+        Uses the SAME pathway as training: the encoder produces per-timestep
+        representations, and the reconstruction head decodes them directly.
+        The model was trained on normal data only, so anomalous patterns
+        produce higher reconstruction error because the model hasn't learned
+        to reconstruct them.
         Args:
             x: (batch_size, seq_len, n_features)
         Returns:
@@ -267,15 +268,11 @@ class ReconstructionBasedDetector:
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Encode full sequence
+            # Encode full sequence (same pathway as training)
             encoder_output = self.reconstructor.encoder(x)  # (B, L, d_model)
 
-            # Bottleneck: compress to single vector, then expand back
-            bottleneck = encoder_output.mean(dim=1, keepdim=True)  # (B, 1, d_model)
-            bottleneck_expanded = bottleneck.expand_as(encoder_output)  # (B, L, d_model)
-
-            # Reconstruct from bottleneck (anomalous timesteps lose their signal)
-            reconstructed = self.reconstructor.reconstruction_head(bottleneck_expanded)
+            # Reconstruct directly from per-timestep encoder output
+            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
 
             if self.use_mahalanobis and self.cov_inv is not None:
                 scores = self.compute_mahalanobis_distance(x, reconstructed)
