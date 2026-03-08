@@ -551,6 +551,8 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     print(f"  Recon-only best:    F1={recon_m['f1']:.3f}  P={recon_m['p']:.3f}  R={recon_m['r']:.3f}")
 
     # Pick whichever strategy has the best F1
+    # Tie-breaking: prefer weighted-sum over OR-ensemble when within 0.02 F1
+    # because weighted-sum generalizes better to test set (single normalized threshold)
     or_percentiles = {}
     candidates = [
         ('or_ensemble', best_or_metrics['f1'], best_or_metrics, best_or_thresholds, True),
@@ -558,7 +560,16 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         ('recon_only', recon_m['f1'], {'precision': recon_m['p'], 'recall': recon_m['r'], 'f1': recon_m['f1']}, {'combined': recon_t, 'recon_only': True}, False),
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
-    winner_name, _, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
+    winner_name, winner_f1, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
+
+    # If OR-ensemble won but weighted-sum is within 0.02 F1, prefer weighted-sum
+    if winner_is_or and ws_m['f1'] >= winner_f1 - 0.02:
+        print(f"  → OR-ensemble ({winner_f1:.3f}) and weighted-sum ({ws_m['f1']:.3f}) within 0.02")
+        print(f"    Preferring weighted-sum (better test generalization)")
+        winner_name = 'weighted_sum'
+        winner_metrics = {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}
+        winner_thresholds = {'combined': ws_t}
+        winner_is_or = False
 
     if winner_is_or:
         print(f"  → Using OR-ensemble (best F1)")
@@ -568,9 +579,8 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
             raw_t = best_or_thresholds[n]
             sc = components[n]
             pctl = (sc < raw_t).mean() * 100.0
-            # Relax by 5 percentile points to improve recall on test set
-            # With ~15% anomaly rate, need thresholds around p80-85
-            pctl_relaxed = max(pctl - 5.0, 50.0)
+            # Relax by 3 percentile points to improve recall on test set
+            pctl_relaxed = max(pctl - 3.0, 50.0)
             or_percentiles[n] = pctl_relaxed
             print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f})")
         use_or_ensemble = True
@@ -630,7 +640,7 @@ def plot_tsne_embeddings(embeddings_np, ground_truth, fig_dir):
         emb_sub = embeddings_np
         gt_sub = ground_truth
 
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
     reduced = tsne.fit_transform(emb_sub)
 
     fig, ax = plt.subplots(figsize=(10, 8))
