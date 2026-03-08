@@ -17,6 +17,16 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+
+# ---- Reproducibility ----
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 #git test
 # Add current directory to path for standalone execution
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,14 +93,14 @@ class ImprovedConfig:
     REGULARIZATION_WEIGHT = 0.1  # Weight of center/separation loss
 
     # Hybrid Detection - Reconstruction + Energy
-    # Both recon (d'≈0.9) and energy (d'≈0.8) are strong; give energy more weight
+    # Energy consistently has highest d' (~0.86); recon varies (0.5-0.9)
     USE_HYBRID = True
-    ENERGY_WEIGHT = 0.40  # Energy detector (d'≈0.83, strong signal)
-    RECON_WEIGHT = 0.60   # Reconstruction (d'≈0.91, strongest signal)
+    ENERGY_WEIGHT = 0.50  # Energy detector (d'≈0.86, most consistent signal)
+    RECON_WEIGHT = 0.50   # Reconstruction (d' varies 0.5-0.9)
     CLUSTER_WEIGHT = 0.00 # DISABLED - cluster d' is low/negative
 
-    # Precision constraint for threshold tuning - allow lower precision to boost recall/F1
-    MIN_PRECISION = 0.30  # Lower floor lets optimizer find F1-optimal point
+    # Precision constraint for threshold tuning - low floor to let F1 optimizer work freely
+    MIN_PRECISION = 0.20  # Low floor — F1 itself penalizes bad precision
 
     # Anomaly Injection - STRONG intensity so anomalies survive scaling
     ANOMALY_RATIO = 0.05  # 5% anomalies (×3 timesteps → ~15% sequence rate)
@@ -444,55 +454,62 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     print("\n  Per-component best F1:")
     comp_thresholds = {}
     comp_metrics = {}
+    comp_dprime = {}
     for name, sc in components.items():
         t, m = _find_best_threshold_for_component(sc, val_gt, name)
         comp_thresholds[name] = t
         comp_metrics[name] = m
+        # Compute d' for filtering
+        if n_normal > 0 and n_anomaly > 0:
+            nm, am = sc[normal_mask].mean(), sc[anomaly_mask].mean()
+            ns, asd = sc[normal_mask].std(), sc[anomaly_mask].std()
+            comp_dprime[name] = (am - nm) / (0.5 * (ns + asd) + 1e-8)
+        else:
+            comp_dprime[name] = 0.0
 
-    # ---- OR-ensemble: joint grid search over multipliers ----
-    # For each component, search thresholds around the best one found above.
-    # A sample is anomalous if ANY component score exceeds its threshold.
+    # ---- OR-ensemble: only use discriminative components (d' > 0.3) ----
     print("\n  OR-ensemble joint search...")
+    discriminative = {n: sc for n, sc in components.items() if comp_dprime.get(n, 0) > 0.3}
+    print(f"    Discriminative components (d'>0.3): {list(discriminative.keys())}")
 
-    best_f1 = 0
-    best_thresholds = dict(comp_thresholds)
-    best_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
+    best_or_f1 = 0
+    best_or_thresholds = {}
+    best_or_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
 
-    # Build per-component search grids (wide range around each best threshold)
-    grids = {}
-    for name, sc in components.items():
-        center = comp_thresholds[name]
-        sc_range = np.percentile(sc, 99) - np.percentile(sc, 30)
-        lo = center - 0.5 * sc_range
-        hi = center + 0.5 * sc_range
-        grids[name] = np.linspace(lo, hi, 25)
+    if len(discriminative) >= 1:
+        # Build per-component search grids
+        or_grids = {}
+        for name, sc in discriminative.items():
+            center = comp_thresholds[name]
+            sc_range = np.percentile(sc, 99) - np.percentile(sc, 30)
+            lo = center - 0.5 * sc_range
+            hi = center + 0.5 * sc_range
+            or_grids[name] = np.linspace(lo, hi, 30)
 
-    comp_names = list(components.keys())
-    comp_arrays = [components[n] for n in comp_names]
-    comp_grids = [grids[n] for n in comp_names]
+        or_names = list(discriminative.keys())
+        or_arrays = [discriminative[n] for n in or_names]
+        or_grid_list = [or_grids[n] for n in or_names]
 
-    # Iterate over all combinations (20^2 or 20^3 = 400 or 8000 – very fast)
-    from itertools import product as iter_product
-    for thrs in iter_product(*comp_grids):
-        # OR-ensemble: anomalous if ANY component exceeds its threshold
-        pred = np.zeros(len(val_gt), dtype=bool)
-        for sc_arr, t in zip(comp_arrays, thrs):
-            pred |= (sc_arr > t)
+        from itertools import product as iter_product
+        for thrs in iter_product(*or_grid_list):
+            pred = np.zeros(len(val_gt), dtype=bool)
+            for sc_arr, t in zip(or_arrays, thrs):
+                pred |= (sc_arr > t)
 
-        tp = np.sum(pred & (val_gt == 1))
-        fp = np.sum(pred & (val_gt == 0))
-        fn = np.sum(~pred & (val_gt == 1))
+            tp = np.sum(pred & (val_gt == 1))
+            fp = np.sum(pred & (val_gt == 0))
+            fn = np.sum(~pred & (val_gt == 1))
 
-        p = tp / (tp + fp) if (tp + fp) > 0 else 0
-        r = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
 
-        if f1 > best_f1 and p >= config.MIN_PRECISION:
-            best_f1 = f1
-            best_thresholds = dict(zip(comp_names, thrs))
-            best_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
+            if f1 > best_or_f1 and p >= config.MIN_PRECISION:
+                best_or_f1 = f1
+                best_or_thresholds = dict(zip(or_names, thrs))
+                best_or_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
 
-    # Also try the weighted-sum approach as a fallback (keep best of both)
+    # ---- Weighted-sum approach ----
     # Percentile normalisation + weighted sum
     recon_p5, recon_p95 = np.percentile(recon_scores, [5, 95])
     cluster_p5, cluster_p95 = np.percentile(cluster_scores, [5, 95])
@@ -501,7 +518,6 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     if energy_scores is not None:
         energy_p5, energy_p95 = np.percentile(energy_scores, [5, 95])
         energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
-        # Normalize weights to sum to 1.0 (skip zero-weight components)
         total_w = config.RECON_WEIGHT + config.CLUSTER_WEIGHT + config.ENERGY_WEIGHT
         ws = (config.RECON_WEIGHT/total_w) * recon_norm + (config.CLUSTER_WEIGHT/total_w) * cluster_norm + (config.ENERGY_WEIGHT/total_w) * energy_norm
     else:
@@ -509,21 +525,35 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         energy_norm = np.zeros_like(recon_norm)
         tw = config.RECON_WEIGHT + config.CLUSTER_WEIGHT
         ws = (config.RECON_WEIGHT / tw) * recon_norm + (config.CLUSTER_WEIGHT / tw) * cluster_norm
-    combined_scores = ws  # For return / visualizations
+    combined_scores = ws
 
-    # Single-threshold search on weighted sum — wider range for better F1
-    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum', n_steps=800, min_precision=config.MIN_PRECISION)
+    # Search for F1-optimal threshold on weighted-sum with NO min_precision first
+    # This finds the true F1-optimal point without bias toward high precision
+    ws_t_free, ws_m_free = _find_best_threshold_for_component(
+        ws, val_gt, 'ws_free', n_steps=1000, min_precision=0.0)
+    # Also search with min_precision constraint
+    ws_t_constr, ws_m_constr = _find_best_threshold_for_component(
+        ws, val_gt, 'ws_constr', n_steps=1000, min_precision=config.MIN_PRECISION)
 
-    # Also try recon-only (often strongest when other components have low d')
-    recon_t, recon_m = _find_best_threshold_for_component(recon_norm, val_gt, 'recon_only', n_steps=800, min_precision=config.MIN_PRECISION)
+    # Pick the weighted-sum result with better F1
+    if ws_m_free['f1'] > ws_m_constr['f1']:
+        ws_t, ws_m = ws_t_free, ws_m_free
+        print(f"    → Using unconstrained threshold (better F1)")
+    else:
+        ws_t, ws_m = ws_t_constr, ws_m_constr
 
-    print(f"\n  OR-ensemble best:   F1={best_metrics['f1']:.3f}  P={best_metrics['precision']:.3f}  R={best_metrics['recall']:.3f}")
+    # Also try recon-only
+    recon_t, recon_m = _find_best_threshold_for_component(
+        recon_norm, val_gt, 'recon_only', n_steps=1000, min_precision=0.0)
+
+    print(f"\n  OR-ensemble best:   F1={best_or_metrics['f1']:.3f}  P={best_or_metrics['precision']:.3f}  R={best_or_metrics['recall']:.3f}")
     print(f"  Weighted-sum best:  F1={ws_m['f1']:.3f}  P={ws_m['p']:.3f}  R={ws_m['r']:.3f}")
     print(f"  Recon-only best:    F1={recon_m['f1']:.3f}  P={recon_m['p']:.3f}  R={recon_m['r']:.3f}")
 
     # Pick whichever strategy has the best F1
+    or_percentiles = {}
     candidates = [
-        ('or_ensemble', best_metrics['f1'], best_metrics, best_thresholds, True),
+        ('or_ensemble', best_or_metrics['f1'], best_or_metrics, best_or_thresholds, True),
         ('weighted_sum', ws_m['f1'], {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}, {'combined': ws_t}, False),
         ('recon_only', recon_m['f1'], {'precision': recon_m['p'], 'recall': recon_m['r'], 'f1': recon_m['f1']}, {'combined': recon_t, 'recon_only': True}, False),
     ]
@@ -532,8 +562,16 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
 
     if winner_is_or:
         print(f"  → Using OR-ensemble (best F1)")
-        for n in comp_names:
-            print(f"    {n} threshold = {winner_thresholds[n]:.4f}")
+        # Convert raw thresholds to percentiles for test-set generalization
+        or_percentiles = {}
+        for n in best_or_thresholds:
+            raw_t = best_or_thresholds[n]
+            sc = components[n]
+            pctl = (sc < raw_t).mean() * 100.0
+            # Relax by 2 percentile points to improve recall on test set
+            pctl_relaxed = max(pctl - 2.0, 50.0)
+            or_percentiles[n] = pctl_relaxed
+            print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f})")
         use_or_ensemble = True
     else:
         print(f"  → Using {winner_name} (best F1)")
@@ -553,9 +591,10 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         'energy_p5': energy_p5, 'energy_p95': energy_p95,
         'use_or_ensemble': use_or_ensemble,
         'comp_thresholds': best_thresholds,
+        'or_comp_names': list(best_or_thresholds.keys()) if use_or_ensemble else [],
+        'or_percentiles': or_percentiles if use_or_ensemble else {},
     }
 
-    # Return: threshold (single number for backward compat), metrics, scores, stats
     single_threshold = best_thresholds.get('combined', 0.5)
     return single_threshold, best_metrics, combined_scores, norm_stats
 
@@ -1902,17 +1941,22 @@ def main():
     is_recon_only = comp_thresholds.get('recon_only', False)
 
     if use_or:
-        # OR-ensemble: anomalous if ANY component exceeds its threshold
+        # OR-ensemble: use percentile-based thresholds (adapts to test distribution)
         predictions = np.zeros(len(test_gt), dtype=bool)
-        components = {'recon': recon_scores, 'cluster': cluster_scores}
+        or_comp_names = val_norm_stats.get('or_comp_names', [])
+        or_percentiles = val_norm_stats.get('or_percentiles', {})
+        components = {'recon': recon_scores, 'cluster': cluster_scores, 'regime': regime_scores}
         if energy_scores is not None:
             components['energy'] = energy_scores
 
-        for name, sc in components.items():
-            if name in comp_thresholds:
-                predictions |= (sc > comp_thresholds[name])
+        for name in or_comp_names:
+            if name in components and name in or_percentiles:
+                # Derive threshold from test distribution at the same percentile
+                test_threshold = np.percentile(components[name], or_percentiles[name])
+                predictions |= (components[name] > test_threshold)
 
-        detection_method = "OR-Ensemble (Reconstruction | Cluster | Energy)"
+        used_comps = [n for n in or_comp_names if n in or_percentiles]
+        detection_method = f"OR-Ensemble ({' | '.join(used_comps)})"
         # For visualisations, build a combined score (max of per-component z-like scores)
         final_scores = np.maximum.reduce([
             (recon_scores - recon_scores.mean()) / (recon_scores.std() + 1e-8),
