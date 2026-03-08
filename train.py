@@ -596,6 +596,13 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     print(f"\n✓ Best Val F1: {best_metrics['f1']:.3f}, Precision: {best_metrics['precision']:.3f}, Recall: {best_metrics['recall']:.3f}")
 
     # Pack norm stats for test-set reuse
+    single_threshold = best_thresholds.get('combined', 0.5)
+
+    # Convert the val threshold to a percentile of the val combined scores.
+    # On the test set we apply this percentile to the test score distribution
+    # for distribution-invariant thresholding.
+    threshold_percentile = float((combined_scores < single_threshold).mean() * 100.0)
+
     norm_stats = {
         'recon_p5': recon_p5, 'recon_p95': recon_p95,
         'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
@@ -604,9 +611,9 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         'comp_thresholds': best_thresholds,
         'or_comp_names': list(best_or_thresholds.keys()) if use_or_ensemble else [],
         'or_percentiles': or_percentiles if use_or_ensemble else {},
+        'threshold_percentile': threshold_percentile,
     }
 
-    single_threshold = best_thresholds.get('combined', 0.5)
     return single_threshold, best_metrics, combined_scores, norm_stats
 
 
@@ -1301,7 +1308,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     plt.tight_layout()
     plt.savefig(f"{fig_dir}/5_precision_recall_curve.png", dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"  ✓ Saved precision-recall curve")
+    print("  ✓ Saved precision-recall curve")
 
     # 6. Detection Examples Timeline
     fig, ax = plt.subplots(figsize=(16, 5))
@@ -1985,18 +1992,18 @@ def main():
         detection_method = "Reconstruction-Only (strongest d' component)"
     else:
         # Weighted-sum with single threshold
-        recon_p5 = val_norm_stats['recon_p5']
-        recon_p95 = val_norm_stats['recon_p95']
-        cluster_p5 = val_norm_stats['cluster_p5']
-        cluster_p95 = val_norm_stats['cluster_p95']
+        # CRITICAL: Normalize using TEST-set percentiles (not val)
+        # Val p5/p95 may not match test distribution, causing threshold shift.
+        # We use percentile-based thresholding for distribution invariance.
+        recon_p5_t, recon_p95_t = np.percentile(recon_scores, [5, 95])
+        cluster_p5_t, cluster_p95_t = np.percentile(cluster_scores, [5, 95])
 
-        recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
-        cluster_norm = np.clip((cluster_scores - cluster_p5) / (cluster_p95 - cluster_p5 + 1e-8), 0, 1)
+        recon_norm = np.clip((recon_scores - recon_p5_t) / (recon_p95_t - recon_p5_t + 1e-8), 0, 1)
+        cluster_norm = np.clip((cluster_scores - cluster_p5_t) / (cluster_p95_t - cluster_p5_t + 1e-8), 0, 1)
 
         if energy_scores is not None:
-            energy_p5 = val_norm_stats['energy_p5']
-            energy_p95 = val_norm_stats['energy_p95']
-            energy_norm = np.clip((energy_scores - energy_p5) / (energy_p95 - energy_p5 + 1e-8), 0, 1)
+            energy_p5_t, energy_p95_t = np.percentile(energy_scores, [5, 95])
+            energy_norm = np.clip((energy_scores - energy_p5_t) / (energy_p95_t - energy_p5_t + 1e-8), 0, 1)
             total_w = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT + ImprovedConfig.ENERGY_WEIGHT
             final_scores = ((ImprovedConfig.RECON_WEIGHT/total_w) * recon_norm +
                            (ImprovedConfig.CLUSTER_WEIGHT/total_w) * cluster_norm +
@@ -2008,7 +2015,13 @@ def main():
                            (ImprovedConfig.CLUSTER_WEIGHT / tw) * cluster_norm)
             detection_method = "Hybrid (Reconstruction + Cluster)"
 
-        predictions = final_scores > best_threshold
+        # Apply threshold as percentile of test scores (distribution-invariant)
+        val_threshold_pctl = val_norm_stats.get('threshold_percentile', None)
+        if val_threshold_pctl is not None:
+            test_threshold = np.percentile(final_scores, val_threshold_pctl)
+        else:
+            test_threshold = best_threshold
+        predictions = final_scores > test_threshold
 
     # Compute metrics
     tp = np.sum((predictions == True) & (test_gt == True))
