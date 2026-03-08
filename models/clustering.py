@@ -308,6 +308,48 @@ class DensityAwareClustering:
 
         return scores
 
+    def compute_regime_transition_scores(self, labels, window=5):
+        """
+        Detect regime transitions by tracking cluster assignment changes
+        across consecutive sequences. Rapid transitions between different
+        regimes indicate instability — a potential anomaly signal.
+
+        Args:
+            labels: (n_samples,) sequential cluster assignments
+            window: number of consecutive labels to consider
+        Returns:
+            scores: (n_samples,) transition anomaly scores in [0, 1]
+                    Higher = more regime transitions in local neighborhood
+        """
+        n = len(labels)
+        scores = np.zeros(n)
+
+        for i in range(n):
+            # Look at a local window around this sample
+            start = max(0, i - window)
+            end = min(n, i + window + 1)
+            local_labels = labels[start:end]
+
+            # Count number of unique regimes in window
+            n_unique = len(np.unique(local_labels))
+
+            # Count transitions (cluster changes between consecutive points)
+            n_transitions = np.sum(local_labels[1:] != local_labels[:-1])
+
+            # Transition rate: fraction of consecutive pairs that change
+            n_pairs = len(local_labels) - 1
+            transition_rate = n_transitions / max(n_pairs, 1)
+
+            # Also check if current label is different from majority in window
+            from collections import Counter
+            majority_label = Counter(local_labels).most_common(1)[0][0]
+            is_minority = 1.0 if labels[i] != majority_label else 0.0
+
+            # Combined: high transition rate + being in minority regime
+            scores[i] = 0.6 * transition_rate + 0.3 * (n_unique / max(self.n_clusters, 1)) + 0.1 * is_minority
+
+        return np.clip(scores, 0, 1)
+
     def get_density_dict(self):
         """Return cluster densities for external use"""
         return self.cluster_densities.copy() if self.cluster_densities else {}

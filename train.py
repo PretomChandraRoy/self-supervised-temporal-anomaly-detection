@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.temporal_transformer import SelfSupervisedTemporalModel
-from models.clustering import DensityAwareClustering
+from models.clustering import DensityAwareClustering, LatentSpaceRegularizer
 from models.anomaly_detector import (
     EnergyBasedAnomalyDetector,
     ReconstructionBasedDetector,
@@ -76,6 +76,11 @@ class ImprovedConfig:
     # Clustering - Fewer, more meaningful clusters
     N_CLUSTERS = 8  # Reduced for clearer separation
     MIN_CLUSTER_SIZE = 100  # Require larger clusters
+
+    # Latent Space Regularization (center loss + separation loss after clustering)
+    REGULARIZATION_EPOCHS = 10  # Fine-tune with regularization after clustering
+    REGULARIZATION_LR = 1e-4  # Lower LR for fine-tuning
+    REGULARIZATION_WEIGHT = 0.1  # Weight of center/separation loss
 
     # Hybrid Detection - Reconstruction + Energy (cluster has negative d', disabled)
     USE_HYBRID = True
@@ -404,9 +409,14 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         cluster_labels = clustering.predict(embeddings_np)
         cluster_scores = clustering.compute_cluster_anomaly_scores(embeddings_np, cluster_labels)
 
+        # Regime transition scores: detect rapid cluster switches in consecutive sequences
+        regime_transition_scores = clustering.compute_regime_transition_scores(cluster_labels)
+
         energy_scores = None
         if config.USE_HYBRID and energy_detector is not None:
-            energy_scores_t = energy_detector(embeddings, cluster_labels=None)
+            # Pass cluster labels for cluster-conditioned energy scoring
+            cluster_labels_t = torch.LongTensor(cluster_labels).to(config.DEVICE)
+            energy_scores_t = energy_detector(embeddings, cluster_labels=cluster_labels_t)
             energy_scores = energy_scores_t.cpu().numpy() if torch.is_tensor(energy_scores_t) else energy_scores_t
 
     # ---- Per-component diagnostics ----
@@ -416,7 +426,7 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     n_anomaly = int(anomaly_mask.sum())
     print(f"\n  Validation: {n_normal} normal, {n_anomaly} anomalous")
 
-    components = {'recon': recon_scores, 'cluster': cluster_scores}
+    components = {'recon': recon_scores, 'cluster': cluster_scores, 'regime': regime_transition_scores}
     if energy_scores is not None:
         components['energy'] = energy_scores
 
@@ -1708,6 +1718,76 @@ def main():
     cluster_labels_tensor = torch.LongTensor(cluster_labels).to(ImprovedConfig.DEVICE)
 
     # ========================================================================
+    # [4b] LATENT SPACE REGULARIZATION
+    # Fine-tune embeddings with center loss + separation loss to improve
+    # cluster structure (as described in the abstract)
+    # ========================================================================
+    print("\n[4b] Applying latent space regularization...")
+    regularizer = LatentSpaceRegularizer(
+        embedding_dim=ImprovedConfig.D_MODEL,
+        n_clusters=ImprovedConfig.N_CLUSTERS,
+        alpha=0.5
+    ).to(ImprovedConfig.DEVICE)
+
+    # Initialize regularizer centers from K-Means results
+    with torch.no_grad():
+        for k in range(ImprovedConfig.N_CLUSTERS):
+            mask = cluster_labels == k
+            if mask.sum() > 0:
+                regularizer.centers.data[k] = torch.FloatTensor(
+                    train_embeddings[mask].mean(axis=0)
+                ).to(ImprovedConfig.DEVICE)
+
+    reg_optimizer = optim.AdamW(
+        list(model.parameters()) + list(regularizer.parameters()),
+        lr=ImprovedConfig.REGULARIZATION_LR,
+        weight_decay=ImprovedConfig.WEIGHT_DECAY
+    )
+
+    model.train()
+    reg_loader = DataLoader(
+        TensorDataset(train_normal_tensor, torch.LongTensor(
+            clustering.predict(train_normal_embeddings)
+        )),
+        batch_size=ImprovedConfig.BATCH_SIZE, shuffle=True
+    )
+
+    for reg_epoch in range(ImprovedConfig.REGULARIZATION_EPOCHS):
+        reg_losses = []
+        for x_batch, cl_batch in reg_loader:
+            x_batch = x_batch.to(ImprovedConfig.DEVICE)
+            cl_batch = cl_batch.to(ImprovedConfig.DEVICE)
+
+            reg_optimizer.zero_grad()
+            recon_loss_val, _ = model(x_batch, use_contrastive=False, use_reconstruction=True)
+            emb = model.get_embeddings(x_batch)
+            reg_loss = regularizer(emb, cl_batch)
+            total_loss = recon_loss_val + ImprovedConfig.REGULARIZATION_WEIGHT * reg_loss
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), ImprovedConfig.GRADIENT_CLIP)
+            reg_optimizer.step()
+            regularizer.update_centers(emb.detach(), cl_batch)
+            reg_losses.append(total_loss.item())
+
+        if (reg_epoch + 1) % 5 == 0 or reg_epoch == 0:
+            print(f"  Reg epoch {reg_epoch+1}/{ImprovedConfig.REGULARIZATION_EPOCHS}: "
+                  f"loss={np.mean(reg_losses):.4f}")
+
+    print("✓ Latent space regularization complete")
+
+    # Re-extract embeddings and re-cluster with regularized representations
+    model.eval()
+    with torch.no_grad():
+        train_embeddings = model.get_embeddings(
+            train_tensor.to(ImprovedConfig.DEVICE)).cpu().numpy()
+        train_normal_embeddings = model.get_embeddings(
+            train_normal_tensor.to(ImprovedConfig.DEVICE)).cpu().numpy()
+    clustering.fit(train_normal_embeddings)
+    cluster_labels = clustering.predict(train_embeddings)
+    cluster_labels_tensor = torch.LongTensor(cluster_labels).to(ImprovedConfig.DEVICE)
+    print(f"✓ Re-clustered with regularized embeddings: {len(np.unique(cluster_labels))} clusters")
+
+    # ========================================================================
     # [5] RECONSTRUCTION DETECTOR
     # ========================================================================
     print("\n[5/8] Fitting reconstruction detector...")
@@ -1761,6 +1841,14 @@ def main():
         if not success:
             print("⚠️  Energy detector training failed, using reconstruction only")
             energy_detector = None
+        else:
+            # Update per-cluster energy statistics for cluster-conditioned scoring
+            model.eval()
+            energy_detector.eval()
+            with torch.no_grad():
+                train_emb = model.get_embeddings(train_tensor.to(ImprovedConfig.DEVICE))
+                energy_detector.update_cluster_statistics(train_emb, cluster_labels_tensor)
+            print("✓ Updated cluster-conditioned energy statistics")
     else:
         print("\n[6/8] Skipping energy detector (reconstruction only)")
 
@@ -1798,9 +1886,13 @@ def main():
         test_cluster_labels = clustering.predict(embeddings_np)
         cluster_scores = clustering.compute_cluster_anomaly_scores(embeddings_np, test_cluster_labels)
 
+        # Regime transition scores
+        regime_scores = clustering.compute_regime_transition_scores(test_cluster_labels)
+
         energy_scores = None
         if ImprovedConfig.USE_HYBRID and energy_detector is not None:
-            energy_scores_t = energy_detector(embeddings, cluster_labels=None)
+            test_cluster_labels_t = torch.LongTensor(test_cluster_labels).to(ImprovedConfig.DEVICE)
+            energy_scores_t = energy_detector(embeddings, cluster_labels=test_cluster_labels_t)
             energy_scores = energy_scores_t.detach().cpu().numpy() if torch.is_tensor(energy_scores_t) else energy_scores_t
 
     # ---- Determine predictions using same strategy as validation ----
