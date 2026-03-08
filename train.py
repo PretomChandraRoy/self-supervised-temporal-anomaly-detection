@@ -78,7 +78,7 @@ class ImprovedConfig:
 
     # Energy detector - More training with better hyperparameters
     USE_ENERGY_DETECTOR = True
-    ENERGY_EPOCHS = 100  # More epochs with clipped data for better convergence
+    ENERGY_EPOCHS = 120  # Extended training for better energy separation
     ENERGY_LR = 5e-4  # Higher LR for stronger energy separation
     ENERGY_GRADIENT_CLIP = 0.5
     ENERGY_WEIGHT_DECAY = 1e-5  # Less weight decay for energy detector
@@ -104,7 +104,7 @@ class ImprovedConfig:
 
     # Anomaly Injection - STRONG intensity so anomalies survive scaling
     ANOMALY_RATIO = 0.05  # 5% anomalies (×3 timesteps → ~15% sequence rate)
-    ANOMALY_INTENSITY = 10.0  # Strong - must survive RobustScaler + normalization
+    ANOMALY_INTENSITY = 12.0  # Strong - must survive RobustScaler + clipping
     ANOMALY_WINDOW = 3  # Affect 3 consecutive timesteps per anomaly
 
     # Threshold Tuning - Wide search for optimal F1 balance
@@ -120,7 +120,7 @@ class ImprovedConfig:
     # System
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     OUTPUT_DIR = 'improved_outputs'
-    EARLY_STOPPING_PATIENCE = 30  # Allow more patience with higher regularization
+    EARLY_STOPPING_PATIENCE = 40  # Allow more patience for slow convergence
 
     # Reporting
     SAVE_PLOTS = True
@@ -477,14 +477,14 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     best_or_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
 
     if len(discriminative) >= 1:
-        # Build per-component search grids
+        # Build per-component search grids — wide range to explore recall-boosting thresholds
         or_grids = {}
         for name, sc in discriminative.items():
             center = comp_thresholds[name]
-            sc_range = np.percentile(sc, 99) - np.percentile(sc, 30)
-            lo = center - 0.5 * sc_range
+            sc_range = np.percentile(sc, 99) - np.percentile(sc, 20)
+            lo = center - 1.0 * sc_range  # Go well below best threshold
             hi = center + 0.5 * sc_range
-            or_grids[name] = np.linspace(lo, hi, 30)
+            or_grids[name] = np.linspace(lo, hi, 40)
 
         or_names = list(discriminative.keys())
         or_arrays = [discriminative[n] for n in or_names]
@@ -568,8 +568,9 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
             raw_t = best_or_thresholds[n]
             sc = components[n]
             pctl = (sc < raw_t).mean() * 100.0
-            # Relax by 2 percentile points to improve recall on test set
-            pctl_relaxed = max(pctl - 2.0, 50.0)
+            # Relax by 5 percentile points to improve recall on test set
+            # With ~15% anomaly rate, need thresholds around p80-85
+            pctl_relaxed = max(pctl - 5.0, 50.0)
             or_percentiles[n] = pctl_relaxed
             print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f})")
         use_or_ensemble = True
