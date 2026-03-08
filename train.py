@@ -69,7 +69,7 @@ class ImprovedConfig:
     # Energy detector - More training with better hyperparameters
     USE_ENERGY_DETECTOR = True
     ENERGY_EPOCHS = 100  # More epochs with clipped data for better convergence
-    ENERGY_LR = 3e-4  # Higher LR with clipped data (more stable gradients)
+    ENERGY_LR = 5e-4  # Higher LR for stronger energy separation
     ENERGY_GRADIENT_CLIP = 0.5
     ENERGY_WEIGHT_DECAY = 1e-5  # Less weight decay for energy detector
 
@@ -82,24 +82,25 @@ class ImprovedConfig:
     REGULARIZATION_LR = 1e-4  # Lower LR for fine-tuning
     REGULARIZATION_WEIGHT = 0.1  # Weight of center/separation loss
 
-    # Hybrid Detection - Reconstruction + Energy (cluster has negative d', disabled)
+    # Hybrid Detection - Reconstruction + Energy
+    # Both recon (d'≈0.9) and energy (d'≈0.8) are strong; give energy more weight
     USE_HYBRID = True
-    ENERGY_WEIGHT = 0.25  # Energy detector (d'=0.32, useful complement)
-    RECON_WEIGHT = 0.75   # Reconstruction (d'=0.72, strongest signal)
-    CLUSTER_WEIGHT = 0.00 # DISABLED - cluster d' was -0.28, hurting detection
+    ENERGY_WEIGHT = 0.40  # Energy detector (d'≈0.83, strong signal)
+    RECON_WEIGHT = 0.60   # Reconstruction (d'≈0.91, strongest signal)
+    CLUSTER_WEIGHT = 0.00 # DISABLED - cluster d' is low/negative
 
-    # Precision constraint for threshold tuning
-    MIN_PRECISION = 0.40  # Require reasonable precision to avoid excessive false positives
+    # Precision constraint for threshold tuning - allow lower precision to boost recall/F1
+    MIN_PRECISION = 0.30  # Lower floor lets optimizer find F1-optimal point
 
     # Anomaly Injection - STRONG intensity so anomalies survive scaling
     ANOMALY_RATIO = 0.05  # 5% anomalies (×3 timesteps → ~15% sequence rate)
     ANOMALY_INTENSITY = 10.0  # Strong - must survive RobustScaler + normalization
     ANOMALY_WINDOW = 3  # Affect 3 consecutive timesteps per anomaly
 
-    # Threshold Tuning - More granular search at higher percentiles
+    # Threshold Tuning - Wide search for optimal F1 balance
     USE_VALIDATION_TUNING = True
-    THRESHOLD_SEARCH_STEPS = 200  # More steps for finer search
-    THRESHOLD_PERCENTILE_MIN = 90  # Start higher for better precision
+    THRESHOLD_SEARCH_STEPS = 300  # More steps for finer search
+    THRESHOLD_PERCENTILE_MIN = 60  # Start lower to find recall-boosting thresholds
     THRESHOLD_PERCENTILE_MAX = 99.9
 
     # Ensemble Detection
@@ -308,16 +309,16 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 anomaly_energy = energies[is_anomaly]
 
                 # Clamp for numerical stability
-                normal_energy = torch.clamp(normal_energy, -10, 10)
-                anomaly_energy = torch.clamp(anomaly_energy, -10, 10)
+                normal_energy = torch.clamp(normal_energy, -15, 15)
+                anomaly_energy = torch.clamp(anomaly_energy, -15, 15)
 
                 # Margin loss: anomaly energy should be at least `margin` higher than normal
-                margin = 5.0
+                margin = 8.0
                 margin_loss = torch.relu(margin + normal_energy.mean() - anomaly_energy.mean())
 
                 # Push normal energies low, anomaly energies high
-                normal_push = torch.relu(normal_energy - 0.0).mean()   # Push below 0
-                anomaly_push = torch.relu(2.0 - anomaly_energy).mean()  # Push above 2
+                normal_push = torch.relu(normal_energy - (-2.0)).mean()   # Push below -2
+                anomaly_push = torch.relu(5.0 - anomaly_energy).mean()  # Push above 5
 
                 # Binary cross-entropy style: sigmoid of energy as anomaly probability
                 anomaly_prob = torch.sigmoid(energies)
@@ -326,7 +327,7 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 # L2 regularization
                 reg_loss = 0.001 * (energies ** 2).mean()
 
-                loss = margin_loss + 0.3 * normal_push + 0.3 * anomaly_push + 1.0 * bce_loss + reg_loss
+                loss = margin_loss + 0.5 * normal_push + 0.5 * anomaly_push + 2.0 * bce_loss + reg_loss
             elif is_normal.sum() > 0:
                 # Only normal samples in this batch
                 loss = torch.relu(energies[is_normal]).mean() + 0.001 * (energies ** 2).mean()
@@ -364,7 +365,7 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
 def _find_best_threshold_for_component(scores, gt, name, n_steps=500, min_precision=0.0):
     """Find the threshold that maximises F1 for a single score vector."""
     best_f1, best_t, best_m = 0, np.median(scores), {'p': 0, 'r': 0, 'f1': 0}
-    lo, hi = np.percentile(scores, 40), np.percentile(scores, 99.9)
+    lo, hi = np.percentile(scores, 20), np.percentile(scores, 99.9)
     for t in np.linspace(lo, hi, n_steps):
         pred = scores > t
         tp = np.sum(pred & (gt == 1))
@@ -457,14 +458,14 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     best_thresholds = dict(comp_thresholds)
     best_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
 
-    # Build per-component search grids (narrow range around each best threshold)
+    # Build per-component search grids (wide range around each best threshold)
     grids = {}
     for name, sc in components.items():
         center = comp_thresholds[name]
-        sc_range = np.percentile(sc, 99) - np.percentile(sc, 50)
-        lo = center - 0.3 * sc_range
-        hi = center + 0.3 * sc_range
-        grids[name] = np.linspace(lo, hi, 20)
+        sc_range = np.percentile(sc, 99) - np.percentile(sc, 30)
+        lo = center - 0.5 * sc_range
+        hi = center + 0.5 * sc_range
+        grids[name] = np.linspace(lo, hi, 25)
 
     comp_names = list(components.keys())
     comp_arrays = [components[n] for n in comp_names]
@@ -510,11 +511,11 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         ws = (config.RECON_WEIGHT / tw) * recon_norm + (config.CLUSTER_WEIGHT / tw) * cluster_norm
     combined_scores = ws  # For return / visualizations
 
-    # Single-threshold search on weighted sum
-    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum', min_precision=config.MIN_PRECISION)
+    # Single-threshold search on weighted sum — wider range for better F1
+    ws_t, ws_m = _find_best_threshold_for_component(ws, val_gt, 'weighted_sum', n_steps=800, min_precision=config.MIN_PRECISION)
 
     # Also try recon-only (often strongest when other components have low d')
-    recon_t, recon_m = _find_best_threshold_for_component(recon_norm, val_gt, 'recon_only', min_precision=config.MIN_PRECISION)
+    recon_t, recon_m = _find_best_threshold_for_component(recon_norm, val_gt, 'recon_only', n_steps=800, min_precision=config.MIN_PRECISION)
 
     print(f"\n  OR-ensemble best:   F1={best_metrics['f1']:.3f}  P={best_metrics['precision']:.3f}  R={best_metrics['recall']:.3f}")
     print(f"  Weighted-sum best:  F1={ws_m['f1']:.3f}  P={ws_m['p']:.3f}  R={ws_m['r']:.3f}")
@@ -1812,7 +1813,7 @@ def main():
 
     recon_detector = ReconstructionBasedDetector(
         reconstructor=model.reconstructor,
-        threshold_percentile=97,  # Higher threshold to reduce false positives
+        threshold_percentile=95,  # Lower threshold to catch more anomalies
         feature_weights=feature_weights_tensor
     )
     # Fit on NORMAL data only — threshold reflects normal reconstruction quality
