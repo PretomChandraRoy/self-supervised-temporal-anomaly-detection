@@ -78,7 +78,7 @@ class ImprovedConfig:
 
     # Energy detector - More training with better hyperparameters
     USE_ENERGY_DETECTOR = True
-    ENERGY_EPOCHS = 120  # Extended training for better energy separation
+    ENERGY_EPOCHS = 150  # Extended training for deeper energy network
     ENERGY_LR = 5e-4  # Higher LR for stronger energy separation
     ENERGY_GRADIENT_CLIP = 0.5
     ENERGY_WEIGHT_DECAY = 1e-5  # Less weight decay for energy detector
@@ -217,9 +217,17 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 data_modified.iloc[t, data_modified.columns.get_loc('low')] = mid - new_range / 2
 
             elif anomaly_type == 'volume_spike':
-                # Very unusual volume
+                # Very unusual volume + correlated price movement
+                # tick_volume gets dropped in preprocessing, so we MUST also
+                # modify price features to make this anomaly type visible.
                 multiplier = np.random.uniform(t_intensity + 5.0, t_intensity + 15.0)
                 data_modified.iloc[t, data_modified.columns.get_loc('tick_volume')] *= multiplier
+                # Add correlated price impact (high volume → price movement + wider range)
+                price_shift = local_std * t_intensity * 0.8 * np.random.choice([-1, 1])
+                data_modified.iloc[t, data_modified.columns.get_loc('close')] += price_shift
+                range_expansion = abs(price_shift) * 0.5
+                data_modified.iloc[t, data_modified.columns.get_loc('high')] += range_expansion
+                data_modified.iloc[t, data_modified.columns.get_loc('low')] -= range_expansion
 
             elif anomaly_type == 'trend_break':
                 # Strong sudden reversal
@@ -238,16 +246,18 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 data_modified.iloc[t, data_modified.columns.get_loc('open')] -= crash_depth * 0.2
 
             elif anomaly_type == 'gap_anomaly':
-                # Gap up/down from previous close
+                # Gap up/down from previous close — also shift close so the
+                # most heavily-weighted feature (close, weight=3.0) sees it
                 if t > 0:
                     prev_close = data_modified.iloc[t-1]['close']
-                    gap = local_std * t_intensity * 1.5 * np.random.choice([-1, 1])
+                    gap = local_std * t_intensity * 2.5 * np.random.choice([-1, 1])
                     data_modified.iloc[t, data_modified.columns.get_loc('open')] = prev_close + gap
+                    data_modified.iloc[t, data_modified.columns.get_loc('close')] = prev_close + gap * 0.6
                     data_modified.iloc[t, data_modified.columns.get_loc('high')] = max(
-                        data_modified.iloc[t]['high'], prev_close + gap
+                        data_modified.iloc[t]['high'], prev_close + abs(gap)
                     )
                     data_modified.iloc[t, data_modified.columns.get_loc('low')] = min(
-                        data_modified.iloc[t]['low'], prev_close + gap
+                        data_modified.iloc[t]['low'], prev_close - abs(gap) * 0.3
                     )
 
             anomaly_mask[t] = True
@@ -330,14 +340,19 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 normal_push = torch.relu(normal_energy - (-2.0)).mean()   # Push below -2
                 anomaly_push = torch.relu(5.0 - anomaly_energy).mean()  # Push above 5
 
-                # Binary cross-entropy style: sigmoid of energy as anomaly probability
+                # Focal loss: focuses on hard examples near the decision boundary
+                # gamma=2.0 down-weights easy examples, alpha=0.75 upweights anomalies
                 anomaly_prob = torch.sigmoid(energies)
-                bce_loss = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='mean')
+                bce_raw = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='none')
+                pt = torch.where(labels == 1, anomaly_prob, 1 - anomaly_prob)
+                alpha_t = torch.where(labels == 1, torch.tensor(0.75), torch.tensor(0.25)).to(energies.device)
+                focal_weight = alpha_t * (1 - pt) ** 2.0
+                focal_loss = (focal_weight * bce_raw).mean()
 
                 # L2 regularization
                 reg_loss = 0.001 * (energies ** 2).mean()
 
-                loss = margin_loss + 0.5 * normal_push + 0.5 * anomaly_push + 2.0 * bce_loss + reg_loss
+                loss = margin_loss + 0.5 * normal_push + 0.5 * anomaly_push + 2.0 * focal_loss + reg_loss
             elif is_normal.sum() > 0:
                 # Only normal samples in this batch
                 loss = torch.relu(energies[is_normal]).mean() + 0.001 * (energies ** 2).mean()
@@ -1204,7 +1219,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     axes[1, 1].legend(fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/1_training_curves.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/1_training_curves.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved training curves")
 
@@ -1222,7 +1237,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     ax.set_title(f'Confusion Matrix (F1={f1:.3f})', fontsize=15, fontweight='bold')
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/2_confusion_matrix.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/2_confusion_matrix.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved confusion matrix")
 
@@ -1249,7 +1264,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/3_performance_metrics.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/3_performance_metrics.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved performance metrics")
 
@@ -1277,7 +1292,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     axes[1].grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/4_anomaly_score_distribution.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/4_anomaly_score_distribution.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved anomaly score distribution")
 
@@ -1306,7 +1321,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     ax.set_ylim([0, 1])
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/5_precision_recall_curve.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/5_precision_recall_curve.png", dpi=300, bbox_inches='tight')
     plt.close()
     print("  ✓ Saved precision-recall curve")
 
@@ -1340,7 +1355,7 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f"{fig_dir}/6_detection_timeline.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/6_detection_timeline.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  ✓ Saved detection timeline")
 
@@ -1992,18 +2007,22 @@ def main():
         detection_method = "Reconstruction-Only (strongest d' component)"
     else:
         # Weighted-sum with single threshold
-        # CRITICAL: Normalize using TEST-set percentiles (not val)
-        # Val p5/p95 may not match test distribution, causing threshold shift.
-        # We use percentile-based thresholding for distribution invariance.
-        recon_p5_t, recon_p95_t = np.percentile(recon_scores, [5, 95])
-        cluster_p5_t, cluster_p95_t = np.percentile(cluster_scores, [5, 95])
+        # Use VALIDATION normalization stats so the threshold is applied at
+        # the exact same operating point that was optimized on the val set.
+        # Re-computing p5/p95 from test data shifts the normalization and
+        # causes the threshold to correspond to a different operating point.
+        recon_p5_v = val_norm_stats['recon_p5']
+        recon_p95_v = val_norm_stats['recon_p95']
+        cluster_p5_v = val_norm_stats['cluster_p5']
+        cluster_p95_v = val_norm_stats['cluster_p95']
 
-        recon_norm = np.clip((recon_scores - recon_p5_t) / (recon_p95_t - recon_p5_t + 1e-8), 0, 1)
-        cluster_norm = np.clip((cluster_scores - cluster_p5_t) / (cluster_p95_t - cluster_p5_t + 1e-8), 0, 1)
+        recon_norm = np.clip((recon_scores - recon_p5_v) / (recon_p95_v - recon_p5_v + 1e-8), 0, 1)
+        cluster_norm = np.clip((cluster_scores - cluster_p5_v) / (cluster_p95_v - cluster_p5_v + 1e-8), 0, 1)
 
         if energy_scores is not None:
-            energy_p5_t, energy_p95_t = np.percentile(energy_scores, [5, 95])
-            energy_norm = np.clip((energy_scores - energy_p5_t) / (energy_p95_t - energy_p5_t + 1e-8), 0, 1)
+            energy_p5_v = val_norm_stats['energy_p5']
+            energy_p95_v = val_norm_stats['energy_p95']
+            energy_norm = np.clip((energy_scores - energy_p5_v) / (energy_p95_v - energy_p5_v + 1e-8), 0, 1)
             total_w = ImprovedConfig.RECON_WEIGHT + ImprovedConfig.CLUSTER_WEIGHT + ImprovedConfig.ENERGY_WEIGHT
             final_scores = ((ImprovedConfig.RECON_WEIGHT/total_w) * recon_norm +
                            (ImprovedConfig.CLUSTER_WEIGHT/total_w) * cluster_norm +
@@ -2015,12 +2034,8 @@ def main():
                            (ImprovedConfig.CLUSTER_WEIGHT / tw) * cluster_norm)
             detection_method = "Hybrid (Reconstruction + Cluster)"
 
-        # Apply threshold as percentile of test scores (distribution-invariant)
-        val_threshold_pctl = val_norm_stats.get('threshold_percentile', None)
-        if val_threshold_pctl is not None:
-            test_threshold = np.percentile(final_scores, val_threshold_pctl)
-        else:
-            test_threshold = best_threshold
+        # Apply the raw threshold directly (same operating point as validation)
+        test_threshold = best_threshold
         predictions = final_scores > test_threshold
 
     # Compute metrics
@@ -2158,5 +2173,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 

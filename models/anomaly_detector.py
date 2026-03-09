@@ -21,14 +21,21 @@ class EnergyBasedAnomalyDetector(nn.Module):
         self.n_clusters = n_clusters
         self.temperature = temperature
 
-        # Energy function (learned)
-        self.energy_net = nn.Sequential(
-            nn.Linear(embedding_dim, 256),
+        # Energy function (learned) - deeper with residual connection
+        self.energy_proj = nn.Linear(embedding_dim, 256)
+        self.energy_block1 = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Dropout(0.1),
         )
+        self.energy_block2 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        self.energy_head = nn.Linear(128, 1)
 
         # Cluster-specific energy normalization
         self.cluster_energy_means = nn.Parameter(torch.zeros(n_clusters))
@@ -36,13 +43,16 @@ class EnergyBasedAnomalyDetector(nn.Module):
 
     def compute_energy(self, embeddings):
         """
-        Compute energy score for embeddings
+        Compute energy score for embeddings using deeper MLP with residual.
         Args:
             embeddings: (batch_size, embedding_dim)
         Returns:
             energy: (batch_size,) - lower is more normal
         """
-        energy = self.energy_net(embeddings).squeeze(-1)
+        h = torch.relu(self.energy_proj(embeddings))   # (B, 256)
+        h = self.energy_block1(h) + h                   # residual connection
+        h = self.energy_block2(h)                        # (B, 128)
+        energy = self.energy_head(h).squeeze(-1)         # (B,)
         return energy
 
     def forward(self, embeddings, cluster_labels=None):
@@ -131,10 +141,10 @@ class ReconstructionBasedDetector:
 
     def compute_reconstruction_error(self, x, reconstructed):
         """
-        Compute reconstruction error focusing on the single worst timestep.
-        Uses max-over-features per timestep so that a spike in even one
-        feature (e.g. close price) produces a high per-timestep error.
-        Then takes max over timesteps to capture point anomalies.
+        Compute reconstruction error focusing on the LAST few timesteps.
+        Since labels use last-point labeling (ANOMALY_WINDOW=3), the anomaly
+        signal lives in the last ~5 timesteps. Using all 60 timesteps dilutes
+        the signal with 55+ normal timesteps.
         Args:
             x: (batch_size, seq_len, n_features) original
             reconstructed: (batch_size, seq_len, n_features) reconstructed
@@ -149,10 +159,14 @@ class ReconstructionBasedDetector:
             weights = self.feature_weights.to(squared_error.device)
             squared_error = squared_error * weights.unsqueeze(0).unsqueeze(0)
 
+        # Focus on last K timesteps where anomaly signal lives
+        focus_k = min(5, squared_error.shape[1])
+        focused_error = squared_error[:, -focus_k:, :]  # (batch, focus_k, n_features)
+
         # Per-timestep error: use MAX over features (not mean)
         # so a spike in any single feature is not diluted
-        per_timestep_max = squared_error.max(dim=2)[0]   # (batch, seq_len)
-        per_timestep_mean = squared_error.mean(dim=2)      # (batch, seq_len)
+        per_timestep_max = focused_error.max(dim=2)[0]   # (batch, focus_k)
+        per_timestep_mean = focused_error.mean(dim=2)      # (batch, focus_k)
 
         # Combine: emphasize the feature-max but include mean as context
         per_timestep_error = 0.7 * per_timestep_max + 0.3 * per_timestep_mean
