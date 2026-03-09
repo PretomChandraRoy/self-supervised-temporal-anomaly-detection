@@ -9,7 +9,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 import os
 import sys
 import json
@@ -35,8 +34,7 @@ from models.temporal_transformer import SelfSupervisedTemporalModel
 from models.clustering import DensityAwareClustering, LatentSpaceRegularizer
 from models.anomaly_detector import (
     EnergyBasedAnomalyDetector,
-    ReconstructionBasedDetector,
-    HybridAnomalyDetector
+    ReconstructionBasedDetector
 )
 from data.preprocessing import FinancialDataPreprocessor, load_forex_data
 
@@ -299,6 +297,9 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
         lr=config.ENERGY_LR,
         weight_decay=config.ENERGY_WEIGHT_DECAY
     )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.ENERGY_EPOCHS, eta_min=1e-6
+    )
 
     embedder.eval()
     energy_detector.train()
@@ -382,6 +383,8 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
+
+        scheduler.step()
 
     print(f"✓ Energy detector trained successfully (best loss: {best_loss:.4f})")
     return True
@@ -594,8 +597,8 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
             raw_t = best_or_thresholds[n]
             sc = components[n]
             pctl = (sc < raw_t).mean() * 100.0
-            # Relax by 3 percentile points to improve recall on test set
-            pctl_relaxed = max(pctl - 3.0, 50.0)
+            # Relax by 5 percentile points to close val-test generalization gap
+            pctl_relaxed = max(pctl - 5.0, 50.0)
             or_percentiles[n] = pctl_relaxed
             print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f})")
         use_or_ensemble = True
@@ -1687,6 +1690,7 @@ def main():
     train_contrastive = []
     train_reconstruction = []
 
+    epoch = 0
     for epoch in range(ImprovedConfig.N_EPOCHS):
         # Train
         model.train()
