@@ -592,15 +592,24 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     if winner_is_or:
         print(f"  → Using OR-ensemble (best F1)")
         # Convert raw thresholds to percentiles for test-set generalization
+        # Asymmetric relaxation: recon (primary, lower pctl) gets more slack,
+        # energy (secondary, high pctl) stays tighter to limit false positives
         or_percentiles = {}
         for n in best_or_thresholds:
             raw_t = best_or_thresholds[n]
             sc = components[n]
             pctl = (sc < raw_t).mean() * 100.0
-            # Relax by 5 percentile points to close val-test generalization gap
-            pctl_relaxed = max(pctl - 5.0, 50.0)
+            if pctl >= 95.0:
+                # High-percentile component (e.g. energy) — minimal relaxation
+                relax = 2.0
+            elif pctl >= 88.0:
+                # Mid-percentile component (e.g. recon) — moderate relaxation
+                relax = 4.0
+            else:
+                relax = 3.0
+            pctl_relaxed = max(pctl - relax, 50.0)
             or_percentiles[n] = pctl_relaxed
-            print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f})")
+            print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f}, relax={relax:.0f})")
         use_or_ensemble = True
     else:
         print(f"  → Using {winner_name} (best F1)")
