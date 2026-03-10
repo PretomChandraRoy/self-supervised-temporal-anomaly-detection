@@ -86,7 +86,9 @@ class EnergyBasedAnomalyDetector(nn.Module):
 
     def update_cluster_statistics(self, embeddings, cluster_labels):
         """
-        Update cluster-specific energy statistics
+        Update cluster-specific energy statistics.
+        Uses direct computation (not EMA) since this is typically called
+        once on the full training set after energy detector training.
         Args:
             embeddings: (batch_size, embedding_dim)
             cluster_labels: (batch_size,)
@@ -99,15 +101,9 @@ class EnergyBasedAnomalyDetector(nn.Module):
                 if mask.sum() > 0:
                     cluster_energies = energy[mask]
 
-                    # Update with EMA
-                    self.cluster_energy_means[k] = (
-                        0.9 * self.cluster_energy_means[k] +
-                        0.1 * cluster_energies.mean()
-                    )
-                    self.cluster_energy_stds[k] = (
-                        0.9 * self.cluster_energy_stds[k] +
-                        0.1 * cluster_energies.std()
-                    )
+                    # Direct computation (not EMA) — correct for single-call usage
+                    self.cluster_energy_means[k] = cluster_energies.mean()
+                    self.cluster_energy_stds[k] = cluster_energies.std().clamp(min=1e-4)
 
 
 class ReconstructionBasedDetector:
@@ -160,7 +156,9 @@ class ReconstructionBasedDetector:
             squared_error = squared_error * weights.unsqueeze(0).unsqueeze(0)
 
         # Focus on last K timesteps where anomaly signal lives
-        focus_k = min(5, squared_error.shape[1])
+        # With ANOMALY_WINDOW=3 and intensity decay, signal can bleed into
+        # 5-8 timesteps after scaling. Wider window captures tail-end residuals.
+        focus_k = min(8, squared_error.shape[1])
         focused_error = squared_error[:, -focus_k:, :]  # (batch, focus_k, n_features)
 
         # Per-timestep error: use MAX over features (not mean)

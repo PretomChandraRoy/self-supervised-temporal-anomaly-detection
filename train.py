@@ -130,7 +130,12 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
     Inject diverse, realistic financial anomalies with STRONG signals.
     Each anomaly affects ANOMALY_WINDOW consecutive timesteps so the signal
     survives windowing (60-step windows with last-point labeling).
+    Uses a dedicated RNG for reproducibility across runs.
     """
+    # Dedicated RNG ensures identical anomaly placement regardless of
+    # upstream random state drift from data loading / feature engineering
+    rng = np.random.RandomState(SEED)
+
     n_samples = len(data)
     n_anomalies = int(n_samples * anomaly_ratio)
     anomaly_window = getattr(ImprovedConfig, 'ANOMALY_WINDOW', 3)
@@ -154,7 +159,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
         n_anomalies = len(safe_indices) // 2
 
     # Select non-overlapping indices
-    all_candidates = np.random.permutation(safe_indices)
+    all_candidates = rng.permutation(safe_indices)
     anomaly_indices = []
     used = set()
     for idx in all_candidates:
@@ -170,7 +175,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
     anomaly_types = []
     for idx in anomaly_indices:
         # Diverse anomaly types with weighted distribution
-        anomaly_type = np.random.choice([
+        anomaly_type = rng.choice([
             'price_spike', 'volatility_spike', 'volume_spike',
             'trend_break', 'flash_crash', 'gap_anomaly'
         ], p=[0.2, 0.2, 0.15, 0.15, 0.2, 0.1])
@@ -190,8 +195,8 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
 
             if anomaly_type == 'price_spike':
                 # Strong sudden price jump
-                multiplier = np.random.uniform(t_intensity, t_intensity + 3.0)
-                direction = np.random.choice([-1, 1])
+                multiplier = rng.uniform(t_intensity, t_intensity + 3.0)
+                direction = rng.choice([-1, 1])
                 spike = local_std * multiplier * direction
 
                 data_modified.iloc[t, data_modified.columns.get_loc('close')] += spike
@@ -206,7 +211,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
 
             elif anomaly_type == 'volatility_spike':
                 # Extreme volatility (much larger range)
-                multiplier = np.random.uniform(t_intensity + 2.0, t_intensity + 5.0)
+                multiplier = rng.uniform(t_intensity + 2.0, t_intensity + 5.0)
                 base_range = data_modified.iloc[t]['high'] - data_modified.iloc[t]['low']
                 new_range = base_range * multiplier
 
@@ -218,10 +223,10 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 # Very unusual volume + correlated price movement
                 # tick_volume gets dropped in preprocessing, so we MUST also
                 # modify price features to make this anomaly type visible.
-                multiplier = np.random.uniform(t_intensity + 5.0, t_intensity + 15.0)
+                multiplier = rng.uniform(t_intensity + 5.0, t_intensity + 15.0)
                 data_modified.iloc[t, data_modified.columns.get_loc('tick_volume')] *= multiplier
                 # Add correlated price impact (high volume → price movement + wider range)
-                price_shift = local_std * t_intensity * 0.8 * np.random.choice([-1, 1])
+                price_shift = local_std * t_intensity * 0.8 * rng.choice([-1, 1])
                 data_modified.iloc[t, data_modified.columns.get_loc('close')] += price_shift
                 range_expansion = abs(price_shift) * 0.5
                 data_modified.iloc[t, data_modified.columns.get_loc('high')] += range_expansion
@@ -232,7 +237,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 window_start = max(0, t-5)
                 mean_price = data_modified.iloc[window_start:t]['close'].mean()
                 deviation = local_std * t_intensity * 2.0
-                new_price = mean_price + deviation if np.random.rand() > 0.5 else mean_price - deviation
+                new_price = mean_price + deviation if rng.rand() > 0.5 else mean_price - deviation
                 data_modified.iloc[t, data_modified.columns.get_loc('close')] = new_price
                 data_modified.iloc[t, data_modified.columns.get_loc('open')] = mean_price
 
@@ -248,7 +253,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 # most heavily-weighted feature (close, weight=3.0) sees it
                 if t > 0:
                     prev_close = data_modified.iloc[t-1]['close']
-                    gap = local_std * t_intensity * 2.5 * np.random.choice([-1, 1])
+                    gap = local_std * t_intensity * 2.5 * rng.choice([-1, 1])
                     data_modified.iloc[t, data_modified.columns.get_loc('open')] = prev_close + gap
                     data_modified.iloc[t, data_modified.columns.get_loc('close')] = prev_close + gap * 0.6
                     data_modified.iloc[t, data_modified.columns.get_loc('high')] = max(
@@ -343,7 +348,11 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
 
                 # Focal loss: focuses on hard examples near the decision boundary
                 # gamma=2.0 down-weights easy examples, alpha=0.75 upweights anomalies
-                anomaly_prob = torch.sigmoid(energies)
+                # Shift sigmoid so decision boundary sits between normal target (-2)
+                # and anomaly target (+5), i.e. at ~1.5. Without this shift,
+                # sigmoid(energies) maps -2→0.12 and +5→0.99 making almost all
+                # examples "easy" and focal loss contributes negligible gradient.
+                anomaly_prob = torch.sigmoid(energies - 1.5)
                 bce_raw = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='none')
                 pt = torch.where(labels == 1, anomaly_prob, 1 - anomaly_prob)
                 alpha_t = torch.where(labels == 1, torch.tensor(0.75), torch.tensor(0.25)).to(energies.device)
@@ -580,9 +589,9 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     candidates.sort(key=lambda x: x[1], reverse=True)
     winner_name, winner_f1, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
 
-    # If OR-ensemble won but weighted-sum is within 0.02 F1, prefer weighted-sum
-    if winner_is_or and ws_m['f1'] >= winner_f1 - 0.02:
-        print(f"  → OR-ensemble ({winner_f1:.3f}) and weighted-sum ({ws_m['f1']:.3f}) within 0.02")
+    # If OR-ensemble won but weighted-sum is within 0.01 F1, prefer weighted-sum
+    if winner_is_or and ws_m['f1'] >= winner_f1 - 0.01:
+        print(f"  → OR-ensemble ({winner_f1:.3f}) and weighted-sum ({ws_m['f1']:.3f}) within 0.01")
         print(f"    Preferring weighted-sum (better test generalization)")
         winner_name = 'weighted_sum'
         winner_metrics = {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}
@@ -599,17 +608,14 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
             raw_t = best_or_thresholds[n]
             sc = components[n]
             pctl = (sc < raw_t).mean() * 100.0
-            if pctl >= 95.0:
-                # High-percentile component (e.g. energy) — minimal relaxation
-                relax = 2.0
-            elif pctl >= 88.0:
-                # Mid-percentile component (e.g. recon) — moderate relaxation
-                relax = 4.0
-            else:
-                relax = 3.0
+            # Adaptive relaxation proportional to 1/d':
+            # High d' → less relaxation (already well-separated, keep tight)
+            # Low d' → more relaxation (needs help capturing anomalies)
+            d_prime = max(comp_dprime.get(n, 0.5), 0.3)
+            relax = min(3.0 / d_prime, 5.0)  # Cap at 5pt to avoid over-relaxation
             pctl_relaxed = max(pctl - relax, 50.0)
             or_percentiles[n] = pctl_relaxed
-            print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f}, relax={relax:.0f})")
+            print(f"    {n} threshold = {raw_t:.4f} (p{pctl:.1f} → relaxed p{pctl_relaxed:.1f}, d'={d_prime:.2f}, relax={relax:.1f})")
         use_or_ensemble = True
     else:
         print(f"  → Using {winner_name} (best F1)")
