@@ -521,13 +521,15 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
 
     if len(discriminative) >= 1:
         # Build per-component search grids — wide range to explore recall-boosting thresholds
+        # OR-ensemble flags if ANY component exceeds its threshold, so lower thresholds
+        # boost recall. We search well below the per-component best to find combos.
         or_grids = {}
         for name, sc in discriminative.items():
             center = comp_thresholds[name]
-            sc_range = np.percentile(sc, 99) - np.percentile(sc, 20)
-            lo = center - 1.0 * sc_range  # Go well below best threshold
+            sc_range = np.percentile(sc, 99) - np.percentile(sc, 10)
+            lo = center - 1.5 * sc_range  # Go well below best threshold for recall
             hi = center + 0.5 * sc_range
-            or_grids[name] = np.linspace(lo, hi, 40)
+            or_grids[name] = np.linspace(lo, hi, 60)  # 60 steps (3600 combos for 2 components)
 
         or_names = list(discriminative.keys())
         or_arrays = [discriminative[n] for n in or_names]
@@ -547,7 +549,8 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
             r = tp / (tp + fn) if (tp + fn) > 0 else 0
             f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
 
-            if f1 > best_or_f1 and p >= config.MIN_PRECISION:
+            # Require minimum precision of 0.3 for OR-ensemble to avoid pure-recall solutions
+            if f1 > best_or_f1 and p >= max(config.MIN_PRECISION, 0.3):
                 best_or_f1 = f1
                 best_or_thresholds = dict(zip(or_names, thrs))
                 best_or_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
@@ -594,8 +597,11 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     print(f"  Recon-only best:    F1={recon_m['f1']:.3f}  P={recon_m['p']:.3f}  R={recon_m['r']:.3f}")
 
     # Pick whichever strategy has the best F1
-    # Tie-breaking: prefer weighted-sum over OR-ensemble when within 0.02 F1
-    # because weighted-sum generalizes better to test set (single normalized threshold)
+    # Tie-breaking rules:
+    # 1. If OR-ensemble and recon-only are within 0.02 F1, prefer higher recall
+    #    (current bottleneck is FN, not FP)
+    # 2. If OR-ensemble and weighted-sum are within 0.01, prefer OR-ensemble
+    #    (it uses complementary signals from both components)
     or_percentiles = {}
     candidates = [
         ('or_ensemble', best_or_metrics['f1'], best_or_metrics, best_or_thresholds, True),
@@ -604,6 +610,17 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
     winner_name, winner_f1, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
+
+    # If recon-only won but OR-ensemble is within 0.02 F1 and has higher recall,
+    # prefer OR-ensemble (it catches anomalies that recon misses)
+    if winner_name == 'recon_only' and best_or_metrics['f1'] >= winner_f1 - 0.02:
+        if best_or_metrics['recall'] > winner_metrics.get('recall', winner_metrics.get('r', 0)) + 0.02:
+            print(f"  → Recon-only ({winner_f1:.3f}) and OR-ensemble ({best_or_metrics['f1']:.3f}) within 0.02")
+            print(f"    Preferring OR-ensemble (higher recall: {best_or_metrics['recall']:.3f} vs {winner_metrics.get('recall', winner_metrics.get('r', 0)):.3f})")
+            winner_name = 'or_ensemble'
+            winner_metrics = best_or_metrics
+            winner_thresholds = best_or_thresholds
+            winner_is_or = True
 
     # If OR-ensemble won but weighted-sum is within 0.01 F1, prefer weighted-sum
     if winner_is_or and ws_m['f1'] >= winner_f1 - 0.01:
