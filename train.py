@@ -77,8 +77,8 @@ class ImprovedConfig:
     # Energy detector - More training with better hyperparameters
     USE_ENERGY_DETECTOR = True
     ENERGY_EPOCHS = 150  # Extended training for deeper energy network
-    ENERGY_LR = 5e-4  # Higher LR for stronger energy separation
-    ENERGY_GRADIENT_CLIP = 0.5
+    ENERGY_LR = 3e-4  # Moderate LR to prevent NaN with per-sample hinge loss
+    ENERGY_GRADIENT_CLIP = 1.0  # Wider clip to prevent gradient starvation
     ENERGY_WEIGHT_DECAY = 1e-5  # Less weight decay for energy detector
 
     # Clustering - Fewer, more meaningful clusters
@@ -310,10 +310,14 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
     energy_detector.train()
 
     best_loss = float('inf')
-    nan_count = 0
 
     for epoch in range(config.ENERGY_EPOCHS):
         epoch_losses = []
+        epoch_nan_count = 0  # Reset per epoch to avoid cumulative false-abort
+
+        # Warm up margin: start at 2.0, ramp to 5.0 over first 30 epochs
+        # Prevents huge gradients early when means are still close
+        margin = min(2.0 + 3.0 * epoch / 30.0, 5.0)
 
         for x, labels in energy_loader:
             x = x.to(config.DEVICE)
@@ -338,26 +342,30 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 normal_energy = torch.clamp(normal_energy, -15, 15)
                 anomaly_energy = torch.clamp(anomaly_energy, -15, 15)
 
-                normal_mean = normal_energy.mean()
-                anomaly_mean = anomaly_energy.mean()
+                # Detach means to prevent double-gradient through both
+                # the per-sample term AND the mean — this was causing NaN
+                normal_mean = normal_energy.mean().detach()
+                anomaly_mean = anomaly_energy.mean().detach()
 
                 # 1. Per-sample hinge loss: each anomaly must individually exceed
                 #    normal mean by margin. Each normal must individually be below
                 #    anomaly mean minus margin. This prevents overlapping tails.
-                margin = 6.0
                 per_anomaly_hinge = torch.relu(margin + normal_mean - anomaly_energy).mean()
                 per_normal_hinge = torch.relu(margin + normal_energy - anomaly_mean).mean()
 
                 # 2. Variance penalty: compress both distributions' tails
-                #    This is the key missing piece — d' was 1.2 but tails overlapped
-                variance_penalty = 0.15 * (normal_energy.var() + anomaly_energy.var())
+                #    Scale down to prevent gradient explosion (was 0.15, now 0.05)
+                variance_penalty = 0.05 * (normal_energy.var() + anomaly_energy.var())
 
                 # 3. Push targets: normal → low energy, anomaly → high energy
                 normal_push = torch.relu(normal_energy - (-2.0)).mean()
                 anomaly_push = torch.relu(5.0 - anomaly_energy).mean()
 
                 # 4. Focal loss for hard examples near decision boundary
-                anomaly_prob = torch.sigmoid(energies - 1.5)
+                #    Clamp sigmoid input to [-10, 10] and output to [eps, 1-eps]
+                #    to prevent log(0) in BCE
+                clamped_logits = torch.clamp(energies - 1.5, -10, 10)
+                anomaly_prob = torch.sigmoid(clamped_logits).clamp(1e-6, 1 - 1e-6)
                 bce_raw = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='none')
                 pt = torch.where(labels == 1, anomaly_prob, 1 - anomaly_prob)
                 alpha_t = torch.where(labels == 1, torch.tensor(0.75), torch.tensor(0.25)).to(energies.device)
@@ -378,12 +386,12 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 # Only anomaly samples (rare)
                 loss = torch.relu(2.0 - energies[is_anomaly]).mean() + 0.001 * (energies ** 2).mean()
 
-            # Check for NaN
+            # Check for NaN — per-epoch counter to avoid cumulative false-abort
             if torch.isnan(loss) or torch.isinf(loss):
-                nan_count += 1
-                if nan_count > 10:
-                    print(f"⚠️  Too many NaN/Inf, stopping energy training at epoch {epoch+1}")
-                    return False
+                epoch_nan_count += 1
+                if epoch_nan_count > 20:
+                    print(f"⚠️  Too many NaN/Inf in epoch {epoch+1}, stopping energy training")
+                    return epoch > 5  # Return True if we trained for at least a few epochs
                 continue
 
             optimizer.zero_grad()
