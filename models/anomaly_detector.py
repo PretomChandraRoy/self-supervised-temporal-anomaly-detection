@@ -156,9 +156,9 @@ class ReconstructionBasedDetector:
             squared_error = squared_error * weights.unsqueeze(0).unsqueeze(0)
 
         # Focus on last K timesteps where anomaly signal lives
-        # With ANOMALY_WINDOW=3 and intensity decay, signal can bleed into
-        # 5-8 timesteps after scaling. Wider window captures tail-end residuals.
-        focus_k = min(8, squared_error.shape[1])
+        # With ANOMALY_WINDOW=3, the signal is concentrated in last 3-4 timesteps.
+        # Using more than 4 dilutes the signal with normal timesteps.
+        focus_k = min(4, squared_error.shape[1])
         focused_error = squared_error[:, -focus_k:, :]  # (batch, focus_k, n_features)
 
         # Per-timestep error: use MAX over features (not mean)
@@ -166,18 +166,18 @@ class ReconstructionBasedDetector:
         per_timestep_max = focused_error.max(dim=2)[0]   # (batch, focus_k)
         per_timestep_mean = focused_error.mean(dim=2)      # (batch, focus_k)
 
-        # Combine: emphasize the feature-max but include mean as context
-        per_timestep_error = 0.7 * per_timestep_max + 0.3 * per_timestep_mean
+        # Combine: heavily emphasize the feature-max
+        per_timestep_error = 0.8 * per_timestep_max + 0.2 * per_timestep_mean
 
         # Over time: max captures the anomalous timestep
         max_error = per_timestep_error.max(dim=1)[0]       # (batch,)
 
-        # Top-K: more robust than pure max
-        k = min(3, per_timestep_error.shape[1])
+        # Top-K: more robust than pure max (top 2 from 4 timesteps)
+        k = min(2, per_timestep_error.shape[1])
         topk_error = per_timestep_error.topk(k, dim=1)[0].mean(dim=1)  # (batch,)
 
-        # Combined: heavily weight the peak
-        errors = 0.6 * max_error + 0.4 * topk_error
+        # Combined: heavily weight the peak for sharper detection
+        errors = 0.7 * max_error + 0.3 * topk_error
 
         return errors
 
@@ -214,21 +214,37 @@ class ReconstructionBasedDetector:
 
         return torch.tensor(distances, device=x.device)
 
+    def _apply_inference_masking(self, encoder_output):
+        """
+        Apply deterministic masking to the last K positions of encoder output
+        before passing to reconstruction head. This aligns inference with the
+        training pathway where the reconstruction head was trained on inputs
+        with mask tokens. By masking the last few positions (where anomaly
+        signal lives), the model must reconstruct from context alone.
+        Normal patterns are easily reconstructed from context; anomalies are not.
+        """
+        mask_k = 4  # Mask last 4 positions (covers ANOMALY_WINDOW=3 + 1 buffer)
+        masked_output = encoder_output.clone()
+        mask_token = self.reconstructor.mask_token  # (1, 1, d_model)
+        masked_output[:, -mask_k:, :] = mask_token.expand(
+            encoder_output.size(0), mask_k, -1
+        )
+        return masked_output
+
     def fit(self, x):
         """
         Fit detector on normal data to establish threshold.
-        Uses the SAME pathway as training: encode → reconstruct directly
-        (no bottleneck). The reconstruction head was trained on per-timestep
-        encoder outputs, so we must use that same pathway at inference.
+        Uses deterministic masking of last K positions to align with training.
         Args:
             x: (n_samples, seq_len, n_features) normal training data
         """
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Use the same pathway as training: encode → reconstruct per-timestep
             encoder_output = self.reconstructor.encoder(x)  # (B, L, d_model)
-            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
+            # Apply inference masking to align with training pathway
+            masked_output = self._apply_inference_masking(encoder_output)
+            reconstructed = self.reconstructor.reconstruction_head(masked_output)
 
             if self.use_mahalanobis:
                 # Fit covariance on residuals
@@ -266,11 +282,10 @@ class ReconstructionBasedDetector:
     def predict(self, x):
         """
         Predict anomaly scores based on reconstruction error.
-        Uses the SAME pathway as training: the encoder produces per-timestep
-        representations, and the reconstruction head decodes them directly.
-        The model was trained on normal data only, so anomalous patterns
-        produce higher reconstruction error because the model hasn't learned
-        to reconstruct them.
+        Uses deterministic masking of last K positions to force reconstruction
+        from context. The model was trained on normal data only, so anomalous
+        patterns produce higher reconstruction error because the model hasn't
+        learned to reconstruct them from surrounding context.
         Args:
             x: (batch_size, seq_len, n_features)
         Returns:
@@ -280,11 +295,14 @@ class ReconstructionBasedDetector:
         self.reconstructor.eval()
 
         with torch.no_grad():
-            # Encode full sequence (same pathway as training)
+            # Encode full sequence
             encoder_output = self.reconstructor.encoder(x)  # (B, L, d_model)
 
-            # Reconstruct directly from per-timestep encoder output
-            reconstructed = self.reconstructor.reconstruction_head(encoder_output)
+            # Apply inference masking (mask last K positions with mask_token)
+            masked_output = self._apply_inference_masking(encoder_output)
+
+            # Reconstruct from masked encoder output
+            reconstructed = self.reconstructor.reconstruction_head(masked_output)
 
             if self.use_mahalanobis and self.cov_inv is not None:
                 scores = self.compute_mahalanobis_distance(x, reconstructed)

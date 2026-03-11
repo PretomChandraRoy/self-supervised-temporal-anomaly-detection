@@ -191,7 +191,7 @@ def inject_diverse_anomalies(data, anomaly_ratio=0.05, intensity=2.0):
                 break
 
             # Scale intensity slightly for each timestep in the window
-            t_intensity = intensity * (1.0 - 0.2 * offset)  # Decay slightly
+            t_intensity = intensity * (1.0 - 0.075 * offset)  # Gentle decay: 1.0, 0.925, 0.85
 
             if anomaly_type == 'price_spike':
                 # Strong sudden price jump
@@ -338,20 +338,25 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 normal_energy = torch.clamp(normal_energy, -15, 15)
                 anomaly_energy = torch.clamp(anomaly_energy, -15, 15)
 
-                # Margin loss: anomaly energy should be at least `margin` higher than normal
-                margin = 8.0
-                margin_loss = torch.relu(margin + normal_energy.mean() - anomaly_energy.mean())
+                normal_mean = normal_energy.mean()
+                anomaly_mean = anomaly_energy.mean()
 
-                # Push normal energies low, anomaly energies high
-                normal_push = torch.relu(normal_energy - (-2.0)).mean()   # Push below -2
-                anomaly_push = torch.relu(5.0 - anomaly_energy).mean()  # Push above 5
+                # 1. Per-sample hinge loss: each anomaly must individually exceed
+                #    normal mean by margin. Each normal must individually be below
+                #    anomaly mean minus margin. This prevents overlapping tails.
+                margin = 6.0
+                per_anomaly_hinge = torch.relu(margin + normal_mean - anomaly_energy).mean()
+                per_normal_hinge = torch.relu(margin + normal_energy - anomaly_mean).mean()
 
-                # Focal loss: focuses on hard examples near the decision boundary
-                # gamma=2.0 down-weights easy examples, alpha=0.75 upweights anomalies
-                # Shift sigmoid so decision boundary sits between normal target (-2)
-                # and anomaly target (+5), i.e. at ~1.5. Without this shift,
-                # sigmoid(energies) maps -2→0.12 and +5→0.99 making almost all
-                # examples "easy" and focal loss contributes negligible gradient.
+                # 2. Variance penalty: compress both distributions' tails
+                #    This is the key missing piece — d' was 1.2 but tails overlapped
+                variance_penalty = 0.15 * (normal_energy.var() + anomaly_energy.var())
+
+                # 3. Push targets: normal → low energy, anomaly → high energy
+                normal_push = torch.relu(normal_energy - (-2.0)).mean()
+                anomaly_push = torch.relu(5.0 - anomaly_energy).mean()
+
+                # 4. Focal loss for hard examples near decision boundary
                 anomaly_prob = torch.sigmoid(energies - 1.5)
                 bce_raw = nn.functional.binary_cross_entropy(anomaly_prob, labels, reduction='none')
                 pt = torch.where(labels == 1, anomaly_prob, 1 - anomaly_prob)
@@ -359,10 +364,13 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
                 focal_weight = alpha_t * (1 - pt) ** 2.0
                 focal_loss = (focal_weight * bce_raw).mean()
 
-                # L2 regularization
+                # 5. L2 regularization
                 reg_loss = 0.001 * (energies ** 2).mean()
 
-                loss = margin_loss + 0.5 * normal_push + 0.5 * anomaly_push + 2.0 * focal_loss + reg_loss
+                loss = (per_anomaly_hinge + per_normal_hinge +
+                        variance_penalty +
+                        0.3 * normal_push + 0.3 * anomaly_push +
+                        1.5 * focal_loss + reg_loss)
             elif is_normal.sum() > 0:
                 # Only normal samples in this batch
                 loss = torch.relu(energies[is_normal]).mean() + 0.001 * (energies ** 2).mean()
@@ -494,10 +502,10 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         else:
             comp_dprime[name] = 0.0
 
-    # ---- OR-ensemble: only use discriminative components (d' > 0.3) ----
+    # ---- OR-ensemble: only use discriminative components (d' > 0.5) ----
     print("\n  OR-ensemble joint search...")
-    discriminative = {n: sc for n, sc in components.items() if comp_dprime.get(n, 0) > 0.3}
-    print(f"    Discriminative components (d'>0.3): {list(discriminative.keys())}")
+    discriminative = {n: sc for n, sc in components.items() if comp_dprime.get(n, 0) > 0.5}
+    print(f"    Discriminative components (d'>0.5): {list(discriminative.keys())}")
 
     best_or_f1 = 0
     best_or_thresholds = {}
