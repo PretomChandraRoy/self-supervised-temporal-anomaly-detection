@@ -592,6 +592,46 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     recon_t, recon_m = _find_best_threshold_for_component(
         recon_norm, val_gt, 'recon_only', n_steps=1000, min_precision=0.0)
 
+    # ---- Cascade approach: recon first, energy rescues recon's misses ----
+    # Key insight: recon has P≈0.9 but R≈0.6 — it misses ~40% of anomalies.
+    # Energy can catch some of those misses. If we only apply energy to samples
+    # that recon marks as normal, energy's FPs only come from that subset,
+    # preserving recon's high precision while boosting recall.
+    cascade_f1 = 0.0
+    cascade_recon_t = 0.0
+    cascade_energy_t = 0.0
+    cascade_metrics = {'precision': 0, 'recall': 0, 'f1': 0}
+
+    if energy_scores is not None and 'energy' in comp_dprime and comp_dprime['energy'] > 0.3:
+        # Search over recon thresholds × energy thresholds
+        recon_thresholds = np.linspace(
+            np.percentile(recon_norm, 70), np.percentile(recon_norm, 99), 40)
+        energy_thresholds = np.linspace(
+            np.percentile(energy_scores, 80), np.percentile(energy_scores, 99.5), 40)
+
+        for rt in recon_thresholds:
+            recon_pred = recon_norm > rt
+            for et in energy_thresholds:
+                # Cascade: flag if recon says anomaly, OR if recon says normal but energy says anomaly
+                energy_rescue = (~recon_pred) & (energy_scores > et)
+                pred = recon_pred | energy_rescue
+
+                tp = np.sum(pred & (val_gt == 1))
+                fp = np.sum(pred & (val_gt == 0))
+                fn = np.sum(~pred & (val_gt == 1))
+
+                p = tp / (tp + fp) if (tp + fp) > 0 else 0
+                r = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+
+                if f1 > cascade_f1 and p >= 0.3:
+                    cascade_f1 = f1
+                    cascade_recon_t = rt
+                    cascade_energy_t = et
+                    cascade_metrics = {'precision': float(p), 'recall': float(r), 'f1': float(f1)}
+
+        print(f"  Cascade best:       F1={cascade_metrics['f1']:.3f}  P={cascade_metrics['precision']:.3f}  R={cascade_metrics['recall']:.3f}")
+
     print(f"\n  OR-ensemble best:   F1={best_or_metrics['f1']:.3f}  P={best_or_metrics['precision']:.3f}  R={best_or_metrics['recall']:.3f}")
     print(f"  Weighted-sum best:  F1={ws_m['f1']:.3f}  P={ws_m['p']:.3f}  R={ws_m['r']:.3f}")
     print(f"  Recon-only best:    F1={recon_m['f1']:.3f}  P={recon_m['p']:.3f}  R={recon_m['r']:.3f}")
@@ -608,6 +648,12 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         ('weighted_sum', ws_m['f1'], {'precision': ws_m['p'], 'recall': ws_m['r'], 'f1': ws_m['f1']}, {'combined': ws_t}, False),
         ('recon_only', recon_m['f1'], {'precision': recon_m['p'], 'recall': recon_m['r'], 'f1': recon_m['f1']}, {'combined': recon_t, 'recon_only': True}, False),
     ]
+    # Add cascade if it was searched
+    if cascade_f1 > 0:
+        candidates.append(
+            ('cascade', cascade_metrics['f1'], cascade_metrics,
+             {'cascade_recon_t': cascade_recon_t, 'cascade_energy_t': cascade_energy_t, 'cascade': True}, False)
+        )
     candidates.sort(key=lambda x: x[1], reverse=True)
     winner_name, winner_f1, winner_metrics, winner_thresholds, winner_is_or = candidates[0]
 
@@ -633,6 +679,7 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
 
     if winner_is_or:
         print(f"  → Using OR-ensemble (best F1)")
+        use_cascade = False
         # Convert raw thresholds to percentiles for test-set generalization
         # Asymmetric relaxation: recon (primary, lower pctl) gets more slack,
         # energy (secondary, high pctl) stays tighter to limit false positives
@@ -653,6 +700,7 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     else:
         print(f"  → Using {winner_name} (best F1)")
         use_or_ensemble = False
+        use_cascade = winner_thresholds.get('cascade', False)
         if winner_name == 'recon_only':
             combined_scores = recon_norm
 
@@ -669,11 +717,25 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
     # for distribution-invariant thresholding.
     threshold_percentile = float((combined_scores < single_threshold).mean() * 100.0)
 
+    # For cascade, store percentiles of recon and energy thresholds
+    cascade_recon_pctl = 0
+    cascade_energy_pctl = 0
+    if use_cascade:
+        cr_t = best_thresholds.get('cascade_recon_t', 0)
+        ce_t = best_thresholds.get('cascade_energy_t', 0)
+        cascade_recon_pctl = float((recon_norm < cr_t).mean() * 100.0)
+        cascade_energy_pctl = float((energy_scores < ce_t).mean() * 100.0)
+        print(f"    Cascade recon threshold: {cr_t:.4f} (p{cascade_recon_pctl:.1f})")
+        print(f"    Cascade energy threshold: {ce_t:.4f} (p{cascade_energy_pctl:.1f})")
+
     norm_stats = {
         'recon_p5': recon_p5, 'recon_p95': recon_p95,
         'cluster_p5': cluster_p5, 'cluster_p95': cluster_p95,
         'energy_p5': energy_p5, 'energy_p95': energy_p95,
         'use_or_ensemble': use_or_ensemble,
+        'use_cascade': use_cascade if not use_or_ensemble else False,
+        'cascade_recon_pctl': cascade_recon_pctl,
+        'cascade_energy_pctl': cascade_energy_pctl,
         'comp_thresholds': best_thresholds,
         'or_comp_names': list(best_or_thresholds.keys()) if use_or_ensemble else [],
         'or_percentiles': or_percentiles if use_or_ensemble else {},
@@ -2022,10 +2084,30 @@ def main():
 
     # ---- Determine predictions using same strategy as validation ----
     use_or = val_norm_stats.get('use_or_ensemble', False)
+    use_cascade = val_norm_stats.get('use_cascade', False)
     comp_thresholds = val_norm_stats.get('comp_thresholds', {})
     is_recon_only = comp_thresholds.get('recon_only', False)
 
-    if use_or:
+    if use_cascade and energy_scores is not None:
+        # Cascade: recon first (high precision), energy rescues recon's misses
+        # Use percentile-based thresholds for test-set generalization
+        recon_p5 = val_norm_stats['recon_p5']
+        recon_p95 = val_norm_stats['recon_p95']
+        recon_norm = np.clip((recon_scores - recon_p5) / (recon_p95 - recon_p5 + 1e-8), 0, 1)
+
+        cascade_recon_pctl = val_norm_stats.get('cascade_recon_pctl', 90)
+        cascade_energy_pctl = val_norm_stats.get('cascade_energy_pctl', 90)
+        test_recon_t = np.percentile(recon_norm, cascade_recon_pctl)
+        test_energy_t = np.percentile(energy_scores, cascade_energy_pctl)
+
+        recon_pred = recon_norm > test_recon_t
+        energy_rescue = (~recon_pred) & (energy_scores > test_energy_t)
+        predictions = recon_pred | energy_rescue
+
+        detection_method = "Cascade (Reconstruction → Energy rescue)"
+        # Combined score for visualizations
+        final_scores = recon_norm  # Primary signal
+    elif use_or:
         # OR-ensemble: use percentile-based thresholds (adapts to test distribution)
         predictions = np.zeros(len(test_gt), dtype=bool)
         or_comp_names = val_norm_stats.get('or_comp_names', [])
