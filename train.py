@@ -3,6 +3,7 @@ IMPROVED FULL TRAINING - Production-Ready Anomaly Detection
 100 epochs, stable energy detector, hybrid fusion, F1 > 70% target
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,6 +20,7 @@ warnings.filterwarnings('ignore')
 
 # ---- Reproducibility ----
 SEED = 42
+random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -40,6 +42,9 @@ from data.preprocessing import FinancialDataPreprocessor, load_forex_data
 
 # Import Excel generation
 from report_generator import generate_detailed_results_excel
+
+# Publication figure style
+import figs_style as FS
 
 
 # ============================================================================
@@ -489,7 +494,7 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         if n_normal > 0 and n_anomaly > 0:
             nm, am = sc[normal_mask].mean(), sc[anomaly_mask].mean()
             ns, asd = sc[normal_mask].std(), sc[anomaly_mask].std()
-            sep = (am - nm) / (0.5 * (ns + asd) + 1e-8)
+            sep = FS.d_prime(sc[anomaly_mask], sc[normal_mask])
             print(f"    {name:12s}: normal={nm:.4f}±{ns:.4f}  anomaly={am:.4f}±{asd:.4f}  "
                   f"d'={sep:.3f}")
 
@@ -502,7 +507,10 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
         t, m = _find_best_threshold_for_component(sc, val_gt, name)
         comp_thresholds[name] = t
         comp_metrics[name] = m
-        # Compute d' for filtering
+        # Gate d': this formula and the > 0.5 threshold at line ~515 were
+        # calibrated together.  It intentionally uses the arithmetic-mean-of-stds
+        # denominator (not the corrected pooled-variance d' used for reporting).
+        # Do NOT swap in the corrected formula without recalibrating the cutoff.
         if n_normal > 0 and n_anomaly > 0:
             nm, am = sc[normal_mask].mean(), sc[anomaly_mask].mean()
             ns, asd = sc[normal_mask].std(), sc[anomaly_mask].std()
@@ -746,129 +754,384 @@ def tune_threshold_on_validation(model, recon_detector, energy_detector, cluster
 
 
 def save_training_plots(train_losses, val_losses, output_dir):
-    """Save training curves"""
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Train Loss', alpha=0.7)
-    plt.plot(val_losses, label='Val Loss', alpha=0.7)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f"{output_dir}/training_curves.png", dpi=150, bbox_inches='tight')
-    plt.close()
+    """Save training curves (quick standalone version called during training)."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(train_losses, label='Train', linewidth=1.8, color=FS.PRIMARY)
+    ax.plot(val_losses, label='Validation', linewidth=1.8, color=FS.ACCENT)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training and Validation Loss')
+    ax.legend()
+    FS.save(fig, f"{output_dir}/training_curves")
     print(f"✓ Saved training curves")
 
 
+# =========================================================================
+# THESIS FIGURE FUNCTIONS  (all use figs_style)
+# =========================================================================
+
+def plot_training_curves(train_losses, val_losses, train_contrastive,
+                         train_reconstruction, fig_dir):
+    """1. Training loss curves — 2×2 grid."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Total loss
+    axes[0, 0].plot(train_losses, lw=1.8, color=FS.PRIMARY, label='Train')
+    axes[0, 0].plot(val_losses, lw=1.8, color=FS.ACCENT, label='Validation')
+    axes[0, 0].set_xlabel('Epoch'); axes[0, 0].set_ylabel('Total Loss')
+    axes[0, 0].set_title('Total Loss'); axes[0, 0].legend()
+
+    # Contrastive
+    axes[0, 1].plot(train_contrastive, lw=1.8, color=FS.NEUTRALS[0])
+    axes[0, 1].set_xlabel('Epoch'); axes[0, 1].set_ylabel('Contrastive Loss')
+    axes[0, 1].set_title('Contrastive Loss')
+
+    # Reconstruction
+    axes[1, 0].plot(train_reconstruction, lw=1.8, color=FS.NEUTRALS[1])
+    axes[1, 0].set_xlabel('Epoch'); axes[1, 0].set_ylabel('Reconstruction Loss')
+    axes[1, 0].set_title('Reconstruction Loss')
+
+    # Improvement %
+    if train_losses[0] > 0:
+        improv = [((train_losses[0] - l) / train_losses[0]) * 100 for l in train_losses]
+        axes[1, 1].plot(improv, lw=1.8, color=FS.GOOD)
+        axes[1, 1].axhline(y=50, color=FS.MUTED, ls='--', lw=1, label='50 %')
+        axes[1, 1].legend()
+    axes[1, 1].set_xlabel('Epoch'); axes[1, 1].set_ylabel('Loss Reduction (%)')
+    axes[1, 1].set_title('Training Improvement')
+
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/1_training_curves")
+    print("  ✓ Saved training curves")
+
+
+def plot_confusion_matrix(tp, fp, fn, tn, precision, recall, f1, accuracy,
+                          fig_dir):
+    """2. Confusion matrix — sequential blue, counts + row-normalised %, metric strip."""
+    import matplotlib.gridspec as gridspec
+
+    cm = np.array([[tn, fp], [fn, tp]])
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_pct = cm / (row_sums + 1e-8) * 100
+
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    fig = plt.figure(figsize=(6, 5.5))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[5, 0.7], hspace=0.25)
+    ax = fig.add_subplot(gs[0])
+    ax_strip = fig.add_subplot(gs[1])
+
+    # Heatmap
+    im = ax.imshow(cm, cmap=FS.SEQ_BLUE_CMAP, aspect='auto')
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Normal', 'Anomaly'])
+    ax.set_yticklabels(['Normal', 'Anomaly'])
+    ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+    ax.set_title('Confusion Matrix')
+
+    # Annotate each cell: count + row %
+    for i in range(2):
+        for j in range(2):
+            color = 'white' if cm[i, j] > cm.max() * 0.6 else FS.INK
+            ax.text(j, i, f"{cm[i, j]}\n({cm_pct[i, j]:.1f}%)",
+                    ha='center', va='center', fontsize=12, fontweight='bold',
+                    color=color)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Count')
+
+    # Metric strip
+    ax_strip.axis('off')
+    strip_text = (f"Accuracy {accuracy:.3f}  │  "
+                  f"Precision {precision:.3f}  │  "
+                  f"Recall {recall:.3f}  │  "
+                  f"Specificity {specificity:.3f}  │  "
+                  f"F1 {f1:.3f}")
+    ax_strip.text(0.5, 0.5, strip_text, ha='center', va='center',
+                  fontsize=9.5, family='monospace',
+                  transform=ax_strip.transAxes,
+                  bbox=dict(boxstyle='round,pad=0.4', facecolor=FS.GRID, edgecolor='none'))
+
+    FS.save(fig, f"{fig_dir}/2_confusion_matrix")
+    print("  ✓ Saved confusion matrix")
+
+
+def plot_performance_metrics(precision, recall, f1, accuracy, fig_dir):
+    """3. Performance bar chart — F1 accented, target line at 0.70."""
+    labels = ['Precision', 'Recall', 'F1 Score', 'Accuracy']
+    values = [precision, recall, f1, accuracy]
+    colors = [FS.NEUTRALS[0], FS.NEUTRALS[1], FS.ACCENT, FS.NEUTRALS[2]]
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(labels, values, color=colors, edgecolor=FS.INK, linewidth=0.7,
+                  width=0.55)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.012,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.axhline(y=0.70, color=FS.MUTED, ls='--', lw=1.2, label='Target (0.70)')
+    ax.set_ylabel('Score'); ax.set_ylim(0, 1.12)
+    ax.set_title('Model Performance')
+    ax.legend()
+    FS.save(fig, f"{fig_dir}/3_performance_metrics")
+    print("  ✓ Saved performance metrics")
+
+
+def plot_score_distribution(anomaly_scores, ground_truth, fig_dir):
+    """4. Anomaly-score distribution (histogram + box)."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    norm_s = anomaly_scores[ground_truth == 0]
+    anom_s = anomaly_scores[ground_truth == 1]
+
+    axes[0].hist(norm_s, bins=50, alpha=0.7, label='Normal', color=FS.PRIMARY,
+                 edgecolor='white', linewidth=0.4)
+    axes[0].hist(anom_s, bins=50, alpha=0.7, label='Anomaly', color=FS.ACCENT,
+                 edgecolor='white', linewidth=0.4)
+    axes[0].set_xlabel('Anomaly Score'); axes[0].set_ylabel('Frequency')
+    axes[0].set_title('Score Distribution'); axes[0].legend()
+
+    bp = axes[1].boxplot([norm_s, anom_s], labels=['Normal', 'Anomaly'],
+                         patch_artist=True,
+                         medianprops=dict(color=FS.BAD, lw=2))
+    bp['boxes'][0].set_facecolor(FS.PRIMARY_L)
+    bp['boxes'][1].set_facecolor(FS.ACCENT_L)
+    axes[1].set_ylabel('Anomaly Score')
+    axes[1].set_title('Score Distribution by Class')
+
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/4_anomaly_score_distribution")
+    print("  ✓ Saved anomaly score distribution")
+
+
+def plot_precision_recall_curve(ground_truth, anomaly_scores, precision_val,
+                                recall_val, fig_dir):
+    """5. Precision-Recall curve — AUC in legend, operating point in ACCENT."""
+    from sklearn.metrics import precision_recall_curve, auc as sk_auc
+
+    prec_arr, rec_arr, _ = precision_recall_curve(ground_truth, anomaly_scores)
+    pr_auc = sk_auc(rec_arr, prec_arr)
+
+    fig, ax = plt.subplots(figsize=(6, 5.5))
+    ax.plot(rec_arr, prec_arr, lw=2, color=FS.PRIMARY,
+            label=f'PR Curve (AUC = {pr_auc:.3f})')
+    ax.fill_between(rec_arr, prec_arr, alpha=0.15, color=FS.PRIMARY_L)
+    ax.scatter([recall_val], [precision_val], s=140, c=FS.ACCENT, marker='*',
+               edgecolors=FS.INK, linewidths=0.8, zorder=5,
+               label=f'Operating Point (P={precision_val:.3f}, R={recall_val:.3f})')
+    ax.set_xlabel('Recall'); ax.set_ylabel('Precision')
+    ax.set_title('Precision–Recall Curve')
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.legend(loc='best')
+    FS.save(fig, f"{fig_dir}/5_precision_recall_curve")
+    print("  ✓ Saved precision-recall curve")
+    return pr_auc
+
+
+def plot_detection_timeline(anomaly_scores, predictions, ground_truth, fig_dir):
+    """6. Detection timeline — score line, shaded true intervals, detection markers."""
+    n_show = min(500, len(anomaly_scores))
+    x = np.arange(n_show)
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+
+    # Shade true anomaly intervals
+    gt_sub = ground_truth[:n_show]
+    in_seg = False
+    for i in range(n_show):
+        if gt_sub[i] == 1 and not in_seg:
+            seg_start = i; in_seg = True
+        if (gt_sub[i] == 0 or i == n_show - 1) and in_seg:
+            ax.axvspan(seg_start, i, alpha=0.18, color=FS.ACCENT_L, zorder=0)
+            in_seg = False
+
+    ax.plot(x, anomaly_scores[:n_show], lw=0.9, color=FS.PRIMARY, alpha=0.8,
+            label='Anomaly Score')
+
+    # Detection markers
+    det_idx = np.where(predictions[:n_show] == 1)[0]
+    if len(det_idx) > 0:
+        ax.scatter(det_idx, anomaly_scores[det_idx], s=30, c=FS.ACCENT,
+                   marker='v', edgecolors=FS.INK, linewidths=0.4, zorder=4,
+                   label=f'Detected ({len(det_idx)})', alpha=0.85)
+
+    # True anomaly markers (if separate from shading)
+    true_idx = np.where(gt_sub == 1)[0]
+    if len(true_idx) > 0:
+        ax.scatter(true_idx, anomaly_scores[true_idx], s=18, c=FS.BAD,
+                   marker='o', edgecolors='none', zorder=3, alpha=0.5,
+                   label=f'True Anomaly ({len(true_idx)})')
+
+    ax.set_xlabel('Sample Index'); ax.set_ylabel('Anomaly Score')
+    ax.set_title('Detection Timeline (First 500 Samples)')
+    ax.legend(fontsize=8, loc='upper right')
+    FS.save(fig, f"{fig_dir}/6_detection_timeline")
+    print("  ✓ Saved detection timeline")
+
+
+def plot_results_dashboard(train_losses, val_losses, anomaly_scores, predictions,
+                           ground_truth, tp, fp, fn, tn, precision, recall,
+                           f1, accuracy, fig_dir):
+    """7. Multi-panel results dashboard."""
+    import seaborn as sns
+
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35)
+
+    # Confusion matrix (mini)
+    ax1 = fig.add_subplot(gs[0, 0])
+    cm = np.array([[tn, fp], [fn, tp]])
+    sns.heatmap(cm, annot=True, fmt='d', cmap=FS.SEQ_BLUE_CMAP, cbar=False,
+                xticklabels=['N', 'A'], yticklabels=['N', 'A'], ax=ax1,
+                linewidths=0.5, linecolor='white')
+    ax1.set_title('Confusion Matrix')
+
+    # Metrics bars
+    ax2 = fig.add_subplot(gs[0, 1:])
+    met_names = ['Precision', 'Recall', 'F1', 'Accuracy']
+    met_vals = [precision, recall, f1, accuracy]
+    met_colors = [FS.NEUTRALS[0], FS.NEUTRALS[1], FS.ACCENT, FS.NEUTRALS[2]]
+    bars = ax2.barh(met_names, met_vals, color=met_colors, edgecolor=FS.INK, lw=0.5)
+    for bar, val in zip(bars, met_vals):
+        ax2.text(val + 0.02, bar.get_y() + bar.get_height() / 2,
+                 f'{val:.3f}', va='center', fontweight='bold', fontsize=9)
+    ax2.set_xlim(0, 1.15); ax2.set_title('Performance Metrics')
+
+    # Training curves
+    ax3 = fig.add_subplot(gs[1, :])
+    ax3.plot(train_losses, lw=1.5, color=FS.PRIMARY, label='Train')
+    ax3.plot(val_losses, lw=1.5, color=FS.ACCENT, label='Validation')
+    ax3.set_xlabel('Epoch'); ax3.set_ylabel('Loss')
+    ax3.set_title('Training Progress'); ax3.legend()
+
+    # Score distribution
+    ax4 = fig.add_subplot(gs[2, :2])
+    ax4.hist(anomaly_scores[ground_truth == 0], bins=40, alpha=0.7,
+             label='Normal', color=FS.PRIMARY, edgecolor='white', lw=0.3)
+    ax4.hist(anomaly_scores[ground_truth == 1], bins=40, alpha=0.7,
+             label='Anomaly', color=FS.ACCENT, edgecolor='white', lw=0.3)
+    ax4.set_xlabel('Anomaly Score'); ax4.set_ylabel('Frequency')
+    ax4.set_title('Score Distribution'); ax4.legend()
+
+    # Stats text
+    ax5 = fig.add_subplot(gs[2, 2])
+    ax5.axis('off')
+    stats = (f"  Samples: {len(ground_truth)}\n"
+             f"  Anomalies: {int(ground_truth.sum())}\n"
+             f"  Detected: {int(predictions.sum())}\n\n"
+             f"  TP: {tp}  FP: {fp}\n"
+             f"  FN: {fn}  TN: {tn}\n\n"
+             f"  F1: {f1:.3f}")
+    ax5.text(0.1, 0.5, stats, fontsize=9.5, family='monospace',
+             va='center', transform=ax5.transAxes,
+             bbox=dict(boxstyle='round,pad=0.5', facecolor=FS.GRID, edgecolor='none'))
+
+    fig.suptitle('Results Dashboard', fontsize=13, fontweight='bold', y=0.98)
+    FS.save(fig, f"{fig_dir}/7_results_dashboard")
+    print("  ✓ Saved results dashboard")
+
+
 def plot_tsne_embeddings(embeddings_np, ground_truth, fig_dir):
-    """8. t-SNE visualization of learned embeddings - validates representation learning"""
+    """8. t-SNE of learned embeddings."""
     from sklearn.manifold import TSNE
 
-    print("  Generating t-SNE embeddings (this may take a moment)...")
-    # Subsample if too many points for speed
-    max_points = 3000
-    if len(embeddings_np) > max_points:
-        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
-        emb_sub = embeddings_np[idx]
-        gt_sub = ground_truth[idx]
+    max_pts = 3000
+    if len(embeddings_np) > max_pts:
+        idx = np.random.choice(len(embeddings_np), max_pts, replace=False)
+        emb, gt = embeddings_np[idx], ground_truth[idx]
     else:
-        emb_sub = embeddings_np
-        gt_sub = ground_truth
+        emb, gt = embeddings_np, ground_truth
 
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
-    reduced = tsne.fit_transform(emb_sub)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=SEED, max_iter=1000)
+    red = tsne.fit_transform(emb)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    # Plot normal points first (background)
-    normal_mask = gt_sub == 0
-    anomaly_mask = gt_sub == 1
-    ax.scatter(reduced[normal_mask, 0], reduced[normal_mask, 1],
-               c='#06A77D', alpha=0.3, s=10, label=f'Normal ({normal_mask.sum()})')
-    ax.scatter(reduced[anomaly_mask, 0], reduced[anomaly_mask, 1],
-               c='#D62828', alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
-               label=f'Anomaly ({anomaly_mask.sum()})')
-    ax.set_title('t-SNE of Learned Transformer Embeddings', fontsize=15, fontweight='bold')
-    ax.set_xlabel('t-SNE Dimension 1', fontsize=12)
-    ax.set_ylabel('t-SNE Dimension 2', fontsize=12)
-    ax.legend(fontsize=12, loc='best')
-    ax.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/8_tsne_embeddings.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig, ax = plt.subplots(figsize=(7, 6))
+    norm_m = gt == 0; anom_m = gt == 1
+    ax.scatter(red[norm_m, 0], red[norm_m, 1], c=FS.PRIMARY, alpha=0.25, s=8,
+               label=f'Normal ({norm_m.sum()})', edgecolors='none')
+    ax.scatter(red[anom_m, 0], red[anom_m, 1], c=FS.ACCENT, alpha=0.8, s=30,
+               edgecolors=FS.INK, linewidths=0.4,
+               label=f'Anomaly ({anom_m.sum()})')
+    ax.set_xlabel('t-SNE 1'); ax.set_ylabel('t-SNE 2')
+    ax.set_title('t-SNE of Learned Embeddings')
+    ax.legend(loc='best')
+    FS.save(fig, f"{fig_dir}/8_tsne_embeddings")
     print("  ✓ Saved t-SNE embeddings")
 
 
-def plot_roc_curve(ground_truth, anomaly_scores, fig_dir):
-    """9. ROC Curve with AUC - standard evaluation metric"""
+def plot_roc_curve(ground_truth, anomaly_scores, recall_val, specificity_val,
+                   fig_dir):
+    """9. ROC curve — AUC in legend, operating point in ACCENT."""
     from sklearn.metrics import roc_curve, roc_auc_score
 
     fpr, tpr, _ = roc_curve(ground_truth, anomaly_scores)
     roc_auc = roc_auc_score(ground_truth, anomaly_scores)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.plot(fpr, tpr, linewidth=3, color='#2E86AB', label=f'ROC Curve (AUC = {roc_auc:.3f})')
-    ax.fill_between(fpr, tpr, alpha=0.2, color='#2E86AB')
-    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.5, label='Random Classifier')
-    ax.set_xlabel('False Positive Rate', fontsize=13, fontweight='bold')
-    ax.set_ylabel('True Positive Rate', fontsize=13, fontweight='bold')
-    ax.set_title(f'Receiver Operating Characteristic (ROC) Curve', fontsize=15, fontweight='bold')
-    ax.legend(fontsize=12, loc='lower right')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim([0, 1])
-    ax.set_ylim([0, 1.02])
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/9_roc_curve.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig, ax = plt.subplots(figsize=(6, 5.5))
+    ax.plot(fpr, tpr, lw=2, color=FS.PRIMARY,
+            label=f'ROC Curve (AUC = {roc_auc:.3f})')
+    ax.fill_between(fpr, tpr, alpha=0.12, color=FS.PRIMARY_L)
+    ax.plot([0, 1], [0, 1], ls='--', lw=1, color=FS.MUTED, label='Random')
+
+    # Operating point
+    op_fpr = 1 - specificity_val
+    op_tpr = recall_val
+    ax.scatter([op_fpr], [op_tpr], s=140, c=FS.ACCENT, marker='*',
+               edgecolors=FS.INK, linewidths=0.8, zorder=5,
+               label=f'Operating Point')
+    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+    ax.set_title('ROC Curve')
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.legend(loc='lower right')
+    FS.save(fig, f"{fig_dir}/9_roc_curve")
     print("  ✓ Saved ROC curve")
+    return roc_auc, fpr, tpr
 
 
 def plot_component_score_comparison(recon_scores, energy_scores, cluster_scores,
                                      ground_truth, fig_dir):
-    """10. Per-component score distributions - shows which detector contributes most"""
-    components = [('Reconstruction', recon_scores, '#2E86AB'),
-                  ('Cluster', cluster_scores, '#F18F01')]
+    """10. Per-component score distributions with corrected d′."""
+    components = [('Reconstruction', recon_scores),
+                  ('Cluster', cluster_scores)]
     if energy_scores is not None:
-        components.append(('Energy', energy_scores, '#A23B72'))
+        components.append(('Energy', energy_scores))
 
     n_cols = len(components)
-    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 5))
+    fig, axes = plt.subplots(1, n_cols, figsize=(5.2 * n_cols, 4.2))
     if n_cols == 1:
         axes = [axes]
 
     normal_mask = ground_truth == 0
     anomaly_mask = ground_truth == 1
+    dprime_values = {}
 
-    for ax, (name, scores, color) in zip(axes, components):
-        ax.hist(scores[normal_mask], bins=50, alpha=0.6, label='Normal',
-                color='#06A77D', edgecolor='black', linewidth=0.5, density=True)
-        ax.hist(scores[anomaly_mask], bins=50, alpha=0.6, label='Anomaly',
-                color='#D62828', edgecolor='black', linewidth=0.5, density=True)
-        ax.set_title(f'{name} Score Distribution', fontsize=13, fontweight='bold')
-        ax.set_xlabel('Score', fontsize=11)
-        ax.set_ylabel('Density', fontsize=11)
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
+    for ax, (name, scores) in zip(axes, components):
+        ax.hist(scores[normal_mask], bins=50, alpha=0.65, label='Normal',
+                color=FS.PRIMARY, edgecolor='white', linewidth=0.3, density=True)
+        ax.hist(scores[anomaly_mask], bins=50, alpha=0.65, label='Anomaly',
+                color=FS.ACCENT, edgecolor='white', linewidth=0.3, density=True)
+        ax.set_xlabel('Score'); ax.set_ylabel('Density')
+        ax.set_title(f'{name}')
+        ax.legend(fontsize=8)
 
-        # Add separation metric
         if normal_mask.sum() > 0 and anomaly_mask.sum() > 0:
-            nm = scores[normal_mask].mean()
-            am = scores[anomaly_mask].mean()
-            ns = scores[normal_mask].std() + 1e-8
-            sep = (am - nm) / ns
-            ax.text(0.95, 0.95, f"d'={sep:.2f}", transform=ax.transAxes,
-                    fontsize=11, fontweight='bold', ha='right', va='top',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.8))
+            dp = FS.d_prime(scores[anomaly_mask], scores[normal_mask])
+            dprime_values[name.lower()] = dp
+            ax.text(0.95, 0.95, FS.d_prime_label(dp),
+                    transform=ax.transAxes, fontsize=9.5, fontweight='bold',
+                    ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=FS.GRID,
+                              edgecolor='none', alpha=0.9))
 
-    plt.suptitle('Per-Component Anomaly Score Distributions', fontsize=15, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/10_component_scores.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/10_component_scores")
     print("  ✓ Saved component score comparison")
+    return dprime_values
 
 
 def plot_ablation_study(recon_scores, energy_scores, cluster_scores,
                         ground_truth, config, fig_dir):
-    """11. Ablation study bar chart - justifies hybrid approach"""
+    """11. Ablation study — honest ordering, ACCENT on 'Full Hybrid (Ours)'."""
 
     def compute_best_f1(scores, gt):
         best_f1 = 0
@@ -880,32 +1143,26 @@ def plot_ablation_study(recon_scores, energy_scores, cluster_scores,
             fn = np.sum(~pred & (gt == 1))
             p = tp / (tp + fp) if (tp + fp) > 0 else 0
             r = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-            if f1 > best_f1:
-                best_f1 = f1
+            f = 2 * p * r / (p + r) if (p + r) > 0 else 0
+            if f > best_f1:
+                best_f1 = f
         return best_f1
 
-    # Normalize each component to [0, 1]
     def norm01(s):
         p5, p95 = np.percentile(s, [5, 95])
         return np.clip((s - p5) / (p95 - p5 + 1e-8), 0, 1)
 
     results = {}
-    results['Reconstruction\nOnly'] = compute_best_f1(recon_scores, ground_truth)
-    results['Cluster\nOnly'] = compute_best_f1(cluster_scores, ground_truth)
+    results['Recon Only'] = compute_best_f1(recon_scores, ground_truth)
+    results['Cluster Only'] = compute_best_f1(cluster_scores, ground_truth)
 
-    # Recon + Cluster
     rc = 0.7 * norm01(recon_scores) + 0.3 * norm01(cluster_scores)
-    results['Recon +\nCluster'] = compute_best_f1(rc, ground_truth)
+    results['Recon+Cluster'] = compute_best_f1(rc, ground_truth)
 
     if energy_scores is not None:
-        results['Energy\nOnly'] = compute_best_f1(energy_scores, ground_truth)
-
-        # Recon + Energy
+        results['Energy Only'] = compute_best_f1(energy_scores, ground_truth)
         re = 0.7 * norm01(recon_scores) + 0.3 * norm01(energy_scores)
-        results['Recon +\nEnergy'] = compute_best_f1(re, ground_truth)
-
-        # Full hybrid
+        results['Recon+Energy'] = compute_best_f1(re, ground_truth)
         hybrid = (config.RECON_WEIGHT * norm01(recon_scores) +
                   config.CLUSTER_WEIGHT * norm01(cluster_scores) +
                   config.ENERGY_WEIGHT * norm01(energy_scores))
@@ -913,35 +1170,34 @@ def plot_ablation_study(recon_scores, energy_scores, cluster_scores,
 
     names = list(results.keys())
     values = list(results.values())
-    colors = ['#A8DADC', '#457B9D', '#1D3557', '#E63946', '#F4A261', '#2A9D8F']
+    # Color: ACCENT for "Ours", NEUTRALS for everything else
+    colors = [FS.ACCENT if 'Ours' in n else FS.NEUTRALS[i % len(FS.NEUTRALS)]
+              for i, n in enumerate(names)]
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.bar(names, values, color=colors[:len(names)], edgecolor='black',
-                  linewidth=1.2, alpha=0.85)
-
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars = ax.bar(names, values, color=colors, edgecolor=FS.INK, linewidth=0.7,
+                  width=0.6)
     for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                f'{val:.3f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.008,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
-    ax.set_ylabel('Best F1 Score', fontsize=13, fontweight='bold')
-    ax.set_title('Ablation Study: Contribution of Each Component', fontsize=15, fontweight='bold')
-    ax.set_ylim(0, max(values) * 1.2 + 0.05)
-    ax.grid(True, alpha=0.3, axis='y')
-    ax.axhline(y=0.7, color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='Target F1=0.70')
-    ax.legend(fontsize=11)
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/11_ablation_study.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    ax.axhline(y=0.70, color=FS.MUTED, ls='--', lw=1.2, label='Target (0.70)')
+    ax.set_ylabel('Best F1 Score'); ax.set_ylim(0, max(values) * 1.18 + 0.05)
+    ax.set_title('Ablation Study')
+    ax.legend()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/11_ablation_study")
     print("  ✓ Saved ablation study")
+    return results
 
 
-def plot_per_anomaly_type_detection(anomaly_type_seq, predictions, ground_truth, fig_dir):
-    """12. Per-anomaly-type detection rate - shows model strengths/weaknesses"""
+def plot_per_anomaly_type_detection(anomaly_type_seq, predictions, ground_truth,
+                                     fig_dir):
+    """12. Per-anomaly-type detection rate — horizontal bars."""
     if anomaly_type_seq is None or len(anomaly_type_seq) == 0:
-        print("  ⚠️ No anomaly type info available, skipping per-type plot")
-        return
+        print("  ⚠️ No anomaly type info, skipping per-type plot")
+        return {}
 
-    # Build per-type detection rates
     type_stats = {}
     for i in range(len(predictions)):
         if ground_truth[i] == 1 and i in anomaly_type_seq:
@@ -953,100 +1209,91 @@ def plot_per_anomaly_type_detection(anomaly_type_seq, predictions, ground_truth,
                 type_stats[atype]['detected'] += 1
 
     if not type_stats:
-        print("  ⚠️ No matched anomaly types in test set, skipping per-type plot")
-        return
+        print("  ⚠️ No matched anomaly types, skipping per-type plot")
+        return {}
 
     types = sorted(type_stats.keys())
-    rates = [type_stats[t]['detected'] / type_stats[t]['total'] if type_stats[t]['total'] > 0 else 0 for t in types]
+    rates = [type_stats[t]['detected'] / type_stats[t]['total']
+             if type_stats[t]['total'] > 0 else 0 for t in types]
     counts = [type_stats[t]['total'] for t in types]
 
-    colors = ['#264653', '#2A9D8F', '#E9C46A', '#F4A261', '#E76F51', '#606C38']
+    fig, ax = plt.subplots(figsize=(8, max(3.5, len(types) * 0.7)))
+    colors = [FS.NEUTRALS[i % len(FS.NEUTRALS)] for i in range(len(types))]
+    y_pos = np.arange(len(types))
+    bars = ax.barh(y_pos, rates, color=colors, edgecolor=FS.INK, linewidth=0.5,
+                   height=0.55)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(types)
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.bar(types, rates, color=colors[:len(types)], edgecolor='black',
-                  linewidth=1.2, alpha=0.85)
+    for bar, rate, cnt in zip(bars, rates, counts):
+        ax.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height() / 2,
+                f'{rate:.1%} (n={cnt})', va='center', fontsize=9)
 
-    for bar, rate, count in zip(bars, rates, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f'{rate:.1%}\n(n={count})', ha='center', va='bottom',
-                fontsize=10, fontweight='bold')
-
-    ax.set_ylabel('Detection Rate', fontsize=13, fontweight='bold')
-    ax.set_xlabel('Anomaly Type', fontsize=13, fontweight='bold')
-    ax.set_title('Detection Rate by Anomaly Type', fontsize=15, fontweight='bold')
-    ax.set_ylim(0, 1.15)
-    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='50% baseline')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.xticks(rotation=30, ha='right')
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/12_per_type_detection.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    ax.axvline(x=0.5, color=FS.MUTED, ls='--', lw=1, label='50 % baseline')
+    ax.set_xlabel('Detection Rate'); ax.set_xlim(0, 1.25)
+    ax.set_title('Detection Rate by Anomaly Type')
+    ax.legend(fontsize=8)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/12_per_type_detection")
     print("  ✓ Saved per-anomaly-type detection rates")
 
+    return {t: {'rate': r, 'total': c, 'detected': type_stats[t]['detected']}
+            for t, r, c in zip(types, rates, counts)}
 
-def plot_cluster_visualization(embeddings_np, cluster_labels, ground_truth, fig_dir):
-    """13. Cluster visualization with anomaly overlay - validates clustering component"""
+
+def plot_cluster_visualization(embeddings_np, cluster_labels, ground_truth,
+                               fig_dir):
+    """13. Cluster visualization with anomaly overlay (PCA)."""
     from sklearn.decomposition import PCA
 
-    # Use PCA for fast 2D projection
-    max_points = 3000
-    if len(embeddings_np) > max_points:
-        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
-        emb_sub = embeddings_np[idx]
-        cl_sub = cluster_labels[idx]
-        gt_sub = ground_truth[idx]
+    max_pts = 3000
+    if len(embeddings_np) > max_pts:
+        idx = np.random.choice(len(embeddings_np), max_pts, replace=False)
+        emb, cl, gt = embeddings_np[idx], cluster_labels[idx], ground_truth[idx]
     else:
-        emb_sub = embeddings_np
-        cl_sub = cluster_labels
-        gt_sub = ground_truth
+        emb, cl, gt = embeddings_np, cluster_labels, ground_truth
 
-    pca = PCA(n_components=2, random_state=42)
-    reduced = pca.fit_transform(emb_sub)
+    pca = PCA(n_components=2, random_state=SEED)
+    red = pca.fit_transform(emb)
+    ev = pca.explained_variance_ratio_
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-    # Left: colored by cluster
-    unique_clusters = np.unique(cl_sub)
-    cmap = plt.cm.get_cmap('tab10', len(unique_clusters))
-    for i, cl in enumerate(unique_clusters):
-        mask = cl_sub == cl
-        axes[0].scatter(reduced[mask, 0], reduced[mask, 1], c=[cmap(i)],
-                        alpha=0.5, s=15, label=f'Cluster {cl} ({mask.sum()})')
-    axes[0].set_title('PCA Projection by Cluster Assignment', fontsize=14, fontweight='bold')
-    axes[0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
-    axes[0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
-    axes[0].legend(fontsize=8, ncol=2, loc='best')
-    axes[0].grid(True, alpha=0.2)
+    # Left: by cluster
+    unique_cl = np.unique(cl)
+    for i, c in enumerate(unique_cl):
+        m = cl == c
+        axes[0].scatter(red[m, 0], red[m, 1],
+                        c=FS.NEUTRALS[i % len(FS.NEUTRALS)],
+                        alpha=0.4, s=10, label=f'Cluster {c} ({m.sum()})')
+    axes[0].set_xlabel(f'PC1 ({ev[0]:.1%})')
+    axes[0].set_ylabel(f'PC2 ({ev[1]:.1%})')
+    axes[0].set_title('By Cluster')
+    axes[0].legend(fontsize=7, ncol=2)
 
-    # Right: colored by ground truth
-    normal = gt_sub == 0
-    anomaly = gt_sub == 1
-    axes[1].scatter(reduced[normal, 0], reduced[normal, 1], c='#06A77D',
-                    alpha=0.3, s=10, label=f'Normal ({normal.sum()})')
-    axes[1].scatter(reduced[anomaly, 0], reduced[anomaly, 1], c='#D62828',
-                    alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
-                    label=f'Anomaly ({anomaly.sum()})')
-    axes[1].set_title('PCA Projection by Ground Truth', fontsize=14, fontweight='bold')
-    axes[1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
-    axes[1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
-    axes[1].legend(fontsize=11, loc='best')
-    axes[1].grid(True, alpha=0.2)
+    # Right: by ground truth
+    norm_m = gt == 0; anom_m = gt == 1
+    axes[1].scatter(red[norm_m, 0], red[norm_m, 1], c=FS.PRIMARY, alpha=0.25,
+                    s=8, label=f'Normal ({norm_m.sum()})', edgecolors='none')
+    axes[1].scatter(red[anom_m, 0], red[anom_m, 1], c=FS.ACCENT, alpha=0.8,
+                    s=28, edgecolors=FS.INK, linewidths=0.4,
+                    label=f'Anomaly ({anom_m.sum()})')
+    axes[1].set_xlabel(f'PC1 ({ev[0]:.1%})')
+    axes[1].set_ylabel(f'PC2 ({ev[1]:.1%})')
+    axes[1].set_title('By Ground Truth')
+    axes[1].legend(fontsize=8)
 
-    plt.suptitle('Cluster Analysis and Anomaly Distribution in Embedding Space',
-                 fontsize=15, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/13_cluster_visualization.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/13_cluster_visualization")
     print("  ✓ Saved cluster visualization")
 
 
 def plot_threshold_sensitivity(anomaly_scores, ground_truth, fig_dir):
-    """14. Threshold sensitivity curve - shows operational robustness"""
+    """14. Threshold sensitivity — P/R/F1 vs threshold, crossover marked."""
     thresholds = np.linspace(np.percentile(anomaly_scores, 10),
                              np.percentile(anomaly_scores, 99.5), 200)
-    precisions, recalls, f1s = [], [], []
-
+    precs, recs, f1s = [], [], []
     for t in thresholds:
         pred = anomaly_scores > t
         tp = np.sum(pred & (ground_truth == 1))
@@ -1054,226 +1301,185 @@ def plot_threshold_sensitivity(anomaly_scores, ground_truth, fig_dir):
         fn = np.sum(~pred & (ground_truth == 1))
         p = tp / (tp + fp) if (tp + fp) > 0 else 0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-        precisions.append(p)
-        recalls.append(r)
-        f1s.append(f1)
+        f = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        precs.append(p); recs.append(r); f1s.append(f)
 
-    best_idx = np.argmax(f1s)
+    best_idx = int(np.argmax(f1s))
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(thresholds, precisions, linewidth=2, color='#2E86AB', label='Precision')
-    ax.plot(thresholds, recalls, linewidth=2, color='#A23B72', label='Recall')
-    ax.plot(thresholds, f1s, linewidth=3, color='#F18F01', label='F1 Score')
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(thresholds, precs, lw=1.5, color=FS.NEUTRALS[0], label='Precision')
+    ax.plot(thresholds, recs, lw=1.5, color=FS.NEUTRALS[1], label='Recall')
+    ax.plot(thresholds, f1s, lw=2.2, color=FS.ACCENT, label='F1 Score')
 
-    # Mark optimal point
-    ax.axvline(x=thresholds[best_idx], color='red', linestyle='--', alpha=0.7,
+    ax.axvline(x=thresholds[best_idx], color=FS.MUTED, ls='--', lw=1,
                label=f'Optimal θ={thresholds[best_idx]:.3f} (F1={f1s[best_idx]:.3f})')
-    ax.scatter([thresholds[best_idx]], [f1s[best_idx]], s=150, c='red',
-               marker='*', zorder=5, edgecolors='black')
+    ax.scatter([thresholds[best_idx]], [f1s[best_idx]], s=100, c=FS.ACCENT,
+               marker='*', zorder=5, edgecolors=FS.INK, linewidths=0.5)
 
-    ax.set_xlabel('Threshold', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Metric Value', fontsize=13, fontweight='bold')
-    ax.set_title('Threshold Sensitivity Analysis', fontsize=15, fontweight='bold')
-    ax.legend(fontsize=11, loc='best')
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('Threshold'); ax.set_ylabel('Metric Value')
+    ax.set_title('Threshold Sensitivity')
     ax.set_ylim(0, 1.05)
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/14_threshold_sensitivity.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("  ✓ Saved threshold sensitivity curve")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/14_threshold_sensitivity")
+    print("  ✓ Saved threshold sensitivity")
 
 
 def plot_reconstruction_error_heatmap(model, test_tensor, ground_truth,
                                        feature_names, config, fig_dir):
-    """15. Reconstruction error heatmap per feature - validates feature weighting"""
+    """15. Per-feature reconstruction error heatmap."""
     model.eval()
     device = config.DEVICE
 
-    # Get reconstruction errors per feature
     with torch.no_grad():
-        # Take a manageable subset
         n_sub = min(500, len(test_tensor))
         x = test_tensor[:n_sub].to(device)
         gt = ground_truth[:n_sub]
-
         encoded = model.encoder(x)
         reconstructed = model.reconstructor.reconstruction_head(encoded)
-        errors = (x - reconstructed).pow(2).cpu().numpy()  # (N, seq_len, n_features)
+        errors = (x - reconstructed).pow(2).cpu().numpy()
 
-    # Average over sequence length
-    errors_per_feature = errors.mean(axis=1)  # (N, n_features)
-
+    errors_per_feature = errors.mean(axis=1)
     normal_errors = errors_per_feature[gt == 0].mean(axis=0)
     anomaly_errors = errors_per_feature[gt == 1].mean(axis=0) if gt.sum() > 0 else np.zeros(len(feature_names))
     error_ratio = anomaly_errors / (normal_errors + 1e-8)
 
-    # Sort by error ratio for cleaner visualization
     sort_idx = np.argsort(error_ratio)[::-1]
     sorted_features = [feature_names[i] for i in sort_idx]
     sorted_normal = normal_errors[sort_idx]
     sorted_anomaly = anomaly_errors[sort_idx]
     sorted_ratio = error_ratio[sort_idx]
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-
-    # Left: Side-by-side bar chart
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     n_feat = len(sorted_features)
     y_pos = np.arange(n_feat)
-    axes[0].barh(y_pos - 0.2, sorted_normal, height=0.35, color='#06A77D',
-                 edgecolor='black', linewidth=0.5, label='Normal', alpha=0.8)
-    axes[0].barh(y_pos + 0.2, sorted_anomaly, height=0.35, color='#D62828',
-                 edgecolor='black', linewidth=0.5, label='Anomaly', alpha=0.8)
-    axes[0].set_yticks(y_pos)
-    axes[0].set_yticklabels(sorted_features, fontsize=9)
-    axes[0].set_xlabel('Mean Reconstruction Error', fontsize=11, fontweight='bold')
-    axes[0].set_title('Reconstruction Error by Feature', fontsize=13, fontweight='bold')
-    axes[0].legend(fontsize=10)
-    axes[0].grid(True, alpha=0.3, axis='x')
-    axes[0].invert_yaxis()
 
-    # Right: Error ratio (anomaly / normal)
-    bar_colors = ['#D62828' if r > 1.5 else '#F4A261' if r > 1.0 else '#06A77D' for r in sorted_ratio]
-    axes[1].barh(y_pos, sorted_ratio, color=bar_colors, edgecolor='black',
-                 linewidth=0.5, alpha=0.85)
-    axes[1].axvline(x=1.0, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
-    axes[1].set_yticks(y_pos)
-    axes[1].set_yticklabels(sorted_features, fontsize=9)
-    axes[1].set_xlabel('Error Ratio (Anomaly / Normal)', fontsize=11, fontweight='bold')
-    axes[1].set_title('Feature Discriminability (Higher = More Discriminative)',
-                      fontsize=13, fontweight='bold')
-    axes[1].grid(True, alpha=0.3, axis='x')
+    # Left: normal vs anomaly
+    axes[0].barh(y_pos - 0.18, sorted_normal, height=0.33, color=FS.PRIMARY,
+                 edgecolor='white', lw=0.3, label='Normal', alpha=0.85)
+    axes[0].barh(y_pos + 0.18, sorted_anomaly, height=0.33, color=FS.ACCENT,
+                 edgecolor='white', lw=0.3, label='Anomaly', alpha=0.85)
+    axes[0].set_yticks(y_pos); axes[0].set_yticklabels(sorted_features, fontsize=8)
+    axes[0].set_xlabel('Mean Reconstruction Error')
+    axes[0].set_title('Error by Feature')
+    axes[0].legend(fontsize=8); axes[0].invert_yaxis()
+
+    # Right: error ratio
+    bar_colors = [FS.BAD if r > 1.5 else FS.ACCENT if r > 1.0 else FS.GOOD
+                  for r in sorted_ratio]
+    axes[1].barh(y_pos, sorted_ratio, color=bar_colors, edgecolor='white', lw=0.3,
+                 alpha=0.85)
+    axes[1].axvline(x=1.0, color=FS.INK, ls='--', lw=1, alpha=0.5)
+    axes[1].set_yticks(y_pos); axes[1].set_yticklabels(sorted_features, fontsize=8)
+    axes[1].set_xlabel('Error Ratio (Anomaly / Normal)')
+    axes[1].set_title('Feature Discriminability')
     axes[1].invert_yaxis()
 
-    plt.suptitle('Reconstruction Error Analysis by Feature', fontsize=15, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/15_reconstruction_error_heatmap.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/15_reconstruction_error_heatmap")
     print("  ✓ Saved reconstruction error heatmap")
 
 
 def plot_attention_heatmap(model, test_tensor, ground_truth, config, fig_dir):
-    """16. Attention heatmap - shows what the Transformer focuses on"""
+    """16. Transformer self-attention heatmap (normal vs anomaly)."""
     model.eval()
     device = config.DEVICE
 
-    # Register hooks to capture attention weights
-    attention_weights = []
+    normal_idx = np.where(ground_truth == 0)[0]
+    anomaly_idx = np.where(ground_truth == 1)[0]
+    if len(normal_idx) == 0 or len(anomaly_idx) == 0:
+        print("  ⚠️ Need both classes for attention heatmap")
+        return None, None
 
-    def hook_fn(module, input, output):
-        # TransformerEncoderLayer uses self-attention internally
-        # output is the layer output, but we need to capture attention from the MHA
-        pass
+    samples = {
+        'Normal': test_tensor[normal_idx[0]:normal_idx[0]+1].to(device),
+        'Anomaly': test_tensor[anomaly_idx[0]:anomaly_idx[0]+1].to(device),
+    }
+    attn_data = {}
 
-    # Use a different approach: manually compute attention from the first layer
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     with torch.no_grad():
-        # Pick one normal and one anomaly sample
-        normal_idx = np.where(ground_truth == 0)[0]
-        anomaly_idx = np.where(ground_truth == 1)[0]
-
-        if len(normal_idx) == 0 or len(anomaly_idx) == 0:
-            print("  ⚠️ Need both normal and anomaly samples for attention heatmap")
-            return
-
-        samples = {
-            'Normal': test_tensor[normal_idx[0]:normal_idx[0]+1].to(device),
-            'Anomaly': test_tensor[anomaly_idx[0]:anomaly_idx[0]+1].to(device),
-        }
-
-        fig, axes = plt.subplots(1, 2, figsize=(18, 6))
-
         for ax, (label, x) in zip(axes, samples.items()):
-            # Get projected input
             projected = model.encoder.input_projection(x)
             projected = model.encoder.pos_encoder(projected)
-
-            # Get attention weights from first transformer layer
             layer = model.encoder.transformer_encoder.layers[0]
-            # Self-attention: Q, K, V from the same input
-            # Use the multihead attention module directly
-            src = layer.norm1(projected)  # Pre-norm
-            attn_output, attn_weights = layer.self_attn(
-                src, src, src, need_weights=True, average_attn_weights=True
-            )
-            # attn_weights shape: (1, seq_len, seq_len)
-            attn = attn_weights[0].cpu().numpy()  # (seq_len, seq_len)
+            src = layer.norm1(projected)
+            _, attn_weights = layer.self_attn(
+                src, src, src, need_weights=True, average_attn_weights=True)
+            attn = attn_weights[0].cpu().numpy()
+            attn_data[label.lower()] = attn
 
-            import seaborn as sns
-            sns.heatmap(attn, cmap='viridis', ax=ax, square=False,
-                        cbar_kws={'label': 'Attention Weight', 'shrink': 0.8})
-            ax.set_title(f'Self-Attention ({label} Sample)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Key Position (Time Step)', fontsize=11)
-            ax.set_ylabel('Query Position (Time Step)', fontsize=11)
+            im = ax.imshow(attn, cmap='viridis', aspect='auto')
+            plt.colorbar(im, ax=ax, shrink=0.8, label='Weight')
+            ax.set_title(f'Attention ({label})')
+            ax.set_xlabel('Key Position'); ax.set_ylabel('Query Position')
 
-            # Show every 10th tick
-            tick_positions = list(range(0, attn.shape[0], 10))
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(tick_positions, fontsize=8)
-            ax.set_yticks(tick_positions)
-            ax.set_yticklabels(tick_positions, fontsize=8)
+            # Sparse ticks
+            step = max(1, attn.shape[0] // 6)
+            ticks = list(range(0, attn.shape[0], step))
+            ax.set_xticks(ticks); ax.set_yticks(ticks)
+            ax.set_xticklabels(ticks, fontsize=7)
+            ax.set_yticklabels(ticks, fontsize=7)
 
-        plt.suptitle('Transformer Self-Attention Patterns', fontsize=15, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(f"{fig_dir}/16_attention_heatmap.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        print("  ✓ Saved attention heatmap")
+            # Disable grid for heatmaps
+            ax.grid(False)
+
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/16_attention_heatmap")
+    print("  ✓ Saved attention heatmap")
+    return attn_data.get('normal'), attn_data.get('anomaly')
 
 
-def plot_energy_score_landscape(embeddings_np, energy_scores, ground_truth, fig_dir):
-    """17. Energy score landscape - validates energy detector learning"""
+def plot_energy_score_landscape(embeddings_np, energy_scores, ground_truth,
+                                fig_dir):
+    """17. Energy score landscape — PCA with energy gradient + GT overlay."""
     if energy_scores is None:
         print("  ⚠️ No energy scores, skipping energy landscape")
         return
 
     from sklearn.decomposition import PCA
 
-    max_points = 3000
-    if len(embeddings_np) > max_points:
-        idx = np.random.choice(len(embeddings_np), max_points, replace=False)
-        emb_sub = embeddings_np[idx]
-        es_sub = energy_scores[idx]
-        gt_sub = ground_truth[idx]
+    max_pts = 3000
+    if len(embeddings_np) > max_pts:
+        idx = np.random.choice(len(embeddings_np), max_pts, replace=False)
+        emb, es, gt = embeddings_np[idx], energy_scores[idx], ground_truth[idx]
     else:
-        emb_sub = embeddings_np
-        es_sub = energy_scores
-        gt_sub = ground_truth
+        emb, es, gt = embeddings_np, energy_scores, ground_truth
 
-    pca = PCA(n_components=2, random_state=42)
-    reduced = pca.fit_transform(emb_sub)
+    pca = PCA(n_components=2, random_state=SEED)
+    red = pca.fit_transform(emb)
+    ev = pca.explained_variance_ratio_
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-    # Left: colored by energy score
-    sc = axes[0].scatter(reduced[:, 0], reduced[:, 1], c=es_sub, cmap='RdYlGn_r',
-                         s=15, alpha=0.6, edgecolors='none')
+    # Left: energy gradient
+    sc = axes[0].scatter(red[:, 0], red[:, 1], c=es, cmap='magma',
+                         s=10, alpha=0.55, edgecolors='none')
     plt.colorbar(sc, ax=axes[0], label='Energy Score', shrink=0.8)
-    axes[0].set_title('Energy Score Distribution in Embedding Space',
-                      fontsize=13, fontweight='bold')
-    axes[0].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
-    axes[0].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
-    axes[0].grid(True, alpha=0.2)
+    axes[0].set_xlabel(f'PC1 ({ev[0]:.1%})')
+    axes[0].set_ylabel(f'PC2 ({ev[1]:.1%})')
+    axes[0].set_title('Energy Score Landscape')
+    axes[0].grid(False)
 
-    # Right: ground truth overlay with energy contour
-    normal = gt_sub == 0
-    anomaly = gt_sub == 1
-    axes[1].scatter(reduced[normal, 0], reduced[normal, 1], c='#06A77D',
-                    alpha=0.3, s=10, label=f'Normal')
-    axes[1].scatter(reduced[anomaly, 0], reduced[anomaly, 1], c='#D62828',
-                    alpha=0.8, s=40, edgecolors='black', linewidths=0.5,
-                    label=f'Anomaly')
-    axes[1].set_title('Ground Truth with Energy Score Overlay',
-                      fontsize=13, fontweight='bold')
-    axes[1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)', fontsize=11)
-    axes[1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)', fontsize=11)
-    axes[1].legend(fontsize=11, loc='best')
-    axes[1].grid(True, alpha=0.2)
+    # Right: ground truth
+    norm_m = gt == 0; anom_m = gt == 1
+    axes[1].scatter(red[norm_m, 0], red[norm_m, 1], c=FS.PRIMARY, alpha=0.25,
+                    s=8, label='Normal', edgecolors='none')
+    axes[1].scatter(red[anom_m, 0], red[anom_m, 1], c=FS.ACCENT, alpha=0.8,
+                    s=28, edgecolors=FS.INK, linewidths=0.4, label='Anomaly')
+    axes[1].set_xlabel(f'PC1 ({ev[0]:.1%})')
+    axes[1].set_ylabel(f'PC2 ({ev[1]:.1%})')
+    axes[1].set_title('Ground Truth Overlay')
+    axes[1].legend(fontsize=8)
 
-    plt.suptitle('Energy-Based Anomaly Detection Landscape', fontsize=15, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f"{fig_dir}/17_energy_landscape.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/17_energy_landscape")
     print("  ✓ Saved energy score landscape")
 
+
+# =========================================================================
+# ORCHESTRATOR
+# =========================================================================
 
 def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
                                   train_reconstruction, anomaly_scores, predictions,
@@ -1284,318 +1490,128 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
                                   cluster_scores=None, anomaly_type_seq=None,
                                   model=None, test_tensor=None, feature_names=None,
                                   config=None):
-    """
-    Generate comprehensive visualizations for thesis
-    """
-    import seaborn as sns
-    sns.set_style("whitegrid")
+    """Generate all publication-quality thesis figures."""
+    FS.set_style()
 
-    # Create figures directory
     fig_dir = f"{output_dir}/thesis_figures"
     os.makedirs(fig_dir, exist_ok=True)
+    n_plots = 0
 
-    # 1. Training Loss Curves
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('Training Progress', fontsize=16, fontweight='bold')
+    # Collect data for paper_metrics
+    collected = {}
 
-    # Total loss
-    axes[0, 0].plot(train_losses, label='Train', linewidth=2, color='#2E86AB')
-    axes[0, 0].plot(val_losses, label='Validation', linewidth=2, color='#A23B72')
-    axes[0, 0].set_xlabel('Epoch', fontsize=12)
-    axes[0, 0].set_ylabel('Total Loss', fontsize=12)
-    axes[0, 0].set_title('Total Loss Over Epochs', fontsize=13, fontweight='bold')
-    axes[0, 0].legend(fontsize=11)
-    axes[0, 0].grid(True, alpha=0.3)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
-    # Contrastive loss
-    axes[0, 1].plot(train_contrastive, linewidth=2, color='#F18F01')
-    axes[0, 1].set_xlabel('Epoch', fontsize=12)
-    axes[0, 1].set_ylabel('Contrastive Loss', fontsize=12)
-    axes[0, 1].set_title('Contrastive Learning Loss', fontsize=13, fontweight='bold')
-    axes[0, 1].grid(True, alpha=0.3)
+    # 1. Training curves
+    try:
+        plot_training_curves(train_losses, val_losses, train_contrastive,
+                             train_reconstruction, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Training curves failed: {e}")
 
-    # Reconstruction loss
-    axes[1, 0].plot(train_reconstruction, linewidth=2, color='#06A77D')
-    axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('Reconstruction Loss', fontsize=12)
-    axes[1, 0].set_title('Reconstruction Loss', fontsize=13, fontweight='bold')
-    axes[1, 0].grid(True, alpha=0.3)
+    # 2. Confusion matrix
+    try:
+        plot_confusion_matrix(tp, fp, fn, tn, precision, recall, f1, accuracy,
+                              fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Confusion matrix failed: {e}")
 
-    # Loss reduction percentage
-    axes[1, 1].plot([((train_losses[0] - l) / train_losses[0]) * 100 for l in train_losses],
-                    linewidth=2, color='#D62828')
-    axes[1, 1].set_xlabel('Epoch', fontsize=12)
-    axes[1, 1].set_ylabel('Loss Reduction (%)', fontsize=12)
-    axes[1, 1].set_title('Training Improvement', fontsize=13, fontweight='bold')
-    axes[1, 1].grid(True, alpha=0.3)
-    axes[1, 1].axhline(y=50, color='gray', linestyle='--', alpha=0.5, label='50% target')
-    axes[1, 1].legend(fontsize=10)
+    # 3. Performance metrics
+    try:
+        plot_performance_metrics(precision, recall, f1, accuracy, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Performance metrics failed: {e}")
 
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/1_training_curves.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved training curves")
+    # 4. Score distribution
+    try:
+        plot_score_distribution(anomaly_scores, ground_truth, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Score distribution failed: {e}")
 
-    # 2. Confusion Matrix
-    fig, ax = plt.subplots(figsize=(10, 8))
-    confusion_matrix = np.array([[tn, fp], [fn, tp]])
+    # 5. Precision-Recall curve
+    pr_auc = None
+    try:
+        pr_auc = plot_precision_recall_curve(ground_truth, anomaly_scores,
+                                              precision, recall, fig_dir)
+        collected['pr_auc'] = pr_auc
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ PR curve failed: {e}")
 
-    sns.heatmap(confusion_matrix, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Normal', 'Anomaly'],
-                yticklabels=['Normal', 'Anomaly'],
-                cbar_kws={'label': 'Count'}, ax=ax, annot_kws={"size": 16})
+    # 6. Detection timeline
+    try:
+        plot_detection_timeline(anomaly_scores, predictions, ground_truth, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Detection timeline failed: {e}")
 
-    ax.set_xlabel('Predicted Label', fontsize=13, fontweight='bold')
-    ax.set_ylabel('True Label', fontsize=13, fontweight='bold')
-    ax.set_title(f'Confusion Matrix (F1={f1:.3f})', fontsize=15, fontweight='bold')
+    # 7. Dashboard
+    try:
+        plot_results_dashboard(train_losses, val_losses, anomaly_scores,
+                               predictions, ground_truth, tp, fp, fn, tn,
+                               precision, recall, f1, accuracy, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Dashboard failed: {e}")
 
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/2_confusion_matrix.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved confusion matrix")
-
-    # 3. Performance Metrics Bar Chart
-    fig, ax = plt.subplots(figsize=(10, 6))
-    metrics = ['Precision', 'Recall', 'F1 Score', 'Accuracy']
-    values = [precision, recall, f1, accuracy]
-    colors = ['#2E86AB', '#A23B72', '#F18F01', '#06A77D']
-
-    bars = ax.bar(metrics, values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
-
-    # Add value labels on bars
-    for bar, value in zip(bars, values):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{value:.3f}',
-                ha='center', va='bottom', fontsize=12, fontweight='bold')
-
-    ax.set_ylabel('Score', fontsize=13, fontweight='bold')
-    ax.set_title('Model Performance Metrics', fontsize=15, fontweight='bold')
-    ax.set_ylim(0, 1.1)
-    ax.axhline(y=0.7, color='red', linestyle='--', linewidth=2, label='Target (0.70)', alpha=0.7)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/3_performance_metrics.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved performance metrics")
-
-    # 4. Anomaly Score Distribution
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-
-    # Histogram
-    axes[0].hist(anomaly_scores[ground_truth == 0], bins=50, alpha=0.7,
-                 label='Normal', color='#06A77D', edgecolor='black')
-    axes[0].hist(anomaly_scores[ground_truth == 1], bins=50, alpha=0.7,
-                 label='Anomaly', color='#D62828', edgecolor='black')
-    axes[0].set_xlabel('Anomaly Score', fontsize=12, fontweight='bold')
-    axes[0].set_ylabel('Frequency', fontsize=12, fontweight='bold')
-    axes[0].set_title('Anomaly Score Distribution', fontsize=13, fontweight='bold')
-    axes[0].legend(fontsize=11)
-    axes[0].grid(True, alpha=0.3)
-
-    # Box plot
-    box_data = [anomaly_scores[ground_truth == 0], anomaly_scores[ground_truth == 1]]
-    bp = axes[1].boxplot(box_data, labels=['Normal', 'Anomaly'], patch_artist=True,
-                         boxprops=dict(facecolor='lightblue', alpha=0.7),
-                         medianprops=dict(color='red', linewidth=2))
-    axes[1].set_ylabel('Anomaly Score', fontsize=12, fontweight='bold')
-    axes[1].set_title('Score Distribution by Class', fontsize=13, fontweight='bold')
-    axes[1].grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/4_anomaly_score_distribution.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved anomaly score distribution")
-
-    # 5. ROC-style curve (Precision-Recall)
-    from sklearn.metrics import precision_recall_curve, auc
-
-    precision_curve, recall_curve, thresholds = precision_recall_curve(ground_truth, anomaly_scores)
-    pr_auc = auc(recall_curve, precision_curve)
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.plot(recall_curve, precision_curve, linewidth=3, color='#2E86AB',
-            label=f'PR Curve (AUC = {pr_auc:.3f})')
-    ax.fill_between(recall_curve, precision_curve, alpha=0.3, color='#2E86AB')
-
-    # Mark current operating point
-    ax.scatter([recall], [precision], s=200, c='red', marker='*',
-               edgecolors='black', linewidths=2, zorder=5,
-               label=f'Operating Point (P={precision:.3f}, R={recall:.3f})')
-
-    ax.set_xlabel('Recall', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Precision', fontsize=13, fontweight='bold')
-    ax.set_title('Precision-Recall Curve', fontsize=15, fontweight='bold')
-    ax.legend(fontsize=11, loc='best')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim([0, 1])
-    ax.set_ylim([0, 1])
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/5_precision_recall_curve.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("  ✓ Saved precision-recall curve")
-
-    # 6. Detection Examples Timeline
-    fig, ax = plt.subplots(figsize=(16, 5))
-
-    # Show first 500 samples
-    n_show = min(500, len(anomaly_scores))
-    x = np.arange(n_show)
-
-    ax.plot(x, anomaly_scores[:n_show], linewidth=1, color='gray', alpha=0.5, label='Anomaly Score')
-
-    # Highlight true anomalies
-    true_anomalies = np.where(ground_truth[:n_show] == 1)[0]
-    if len(true_anomalies) > 0:
-        ax.scatter(true_anomalies, anomaly_scores[true_anomalies],
-                  c='red', s=100, marker='o', label='True Anomaly',
-                  edgecolors='black', linewidths=1.5, zorder=5)
-
-    # Highlight detected anomalies
-    detected = np.where(predictions[:n_show] == 1)[0]
-    if len(detected) > 0:
-        ax.scatter(detected, anomaly_scores[detected],
-                  c='blue', s=50, marker='^', label='Detected',
-                  edgecolors='black', linewidths=1, zorder=4, alpha=0.7)
-
-    ax.set_xlabel('Sample Index', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Anomaly Score', fontsize=12, fontweight='bold')
-    ax.set_title('Anomaly Detection Timeline (First 500 Samples)', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/6_detection_timeline.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved detection timeline")
-
-    # 7. Summary Dashboard
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-
-    # Confusion Matrix
-    ax1 = fig.add_subplot(gs[0, 0])
-    cm = np.array([[tn, fp], [fn, tp]])
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
-                xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'], ax=ax1)
-    ax1.set_title('Confusion Matrix', fontweight='bold')
-
-    # Metrics
-    ax2 = fig.add_subplot(gs[0, 1:])
-    metrics_list = ['Precision', 'Recall', 'F1', 'Accuracy']
-    values_list = [precision, recall, f1, accuracy]
-    colors_list = ['#2E86AB', '#A23B72', '#F18F01', '#06A77D']
-    bars = ax2.barh(metrics_list, values_list, color=colors_list, alpha=0.8, edgecolor='black')
-    for bar, val in zip(bars, values_list):
-        ax2.text(val + 0.02, bar.get_y() + bar.get_height()/2, f'{val:.3f}',
-                va='center', fontweight='bold')
-    ax2.set_xlim(0, 1.1)
-    ax2.set_title('Performance Metrics', fontweight='bold')
-    ax2.grid(True, alpha=0.3, axis='x')
-
-    # Training curves
-    ax3 = fig.add_subplot(gs[1, :])
-    ax3.plot(train_losses, label='Train Loss', linewidth=2, color='#2E86AB')
-    ax3.plot(val_losses, label='Val Loss', linewidth=2, color='#A23B72')
-    ax3.set_xlabel('Epoch', fontweight='bold')
-    ax3.set_ylabel('Loss', fontweight='bold')
-    ax3.set_title('Training Progress', fontweight='bold')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-
-    # Score distribution
-    ax4 = fig.add_subplot(gs[2, :2])
-    ax4.hist(anomaly_scores[ground_truth == 0], bins=40, alpha=0.7,
-            label='Normal', color='#06A77D', edgecolor='black')
-    ax4.hist(anomaly_scores[ground_truth == 1], bins=40, alpha=0.7,
-            label='Anomaly', color='#D62828', edgecolor='black')
-    ax4.set_xlabel('Anomaly Score', fontweight='bold')
-    ax4.set_ylabel('Frequency', fontweight='bold')
-    ax4.set_title('Score Distribution', fontweight='bold')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-
-    # Stats text
-    ax5 = fig.add_subplot(gs[2, 2])
-    ax5.axis('off')
-    stats_text = f"""
-    STATISTICS
-    ═══════════
-    Total Samples: {len(ground_truth)}
-    True Anomalies: {ground_truth.sum()}
-    Detected: {predictions.sum()}
-    
-    PERFORMANCE
-    ═══════════
-    True Positives: {tp}
-    False Positives: {fp}
-    False Negatives: {fn}
-    True Negatives: {tn}
-    
-    Precision: {precision:.3f}
-    Recall: {recall:.3f}
-    F1 Score: {f1:.3f}
-    Accuracy: {accuracy:.3f}
-    """
-    ax5.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
-            verticalalignment='center')
-
-    fig.suptitle('Anomaly Detection Results Dashboard', fontsize=18, fontweight='bold', y=0.98)
-    plt.savefig(f"{fig_dir}/7_results_dashboard.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  ✓ Saved results dashboard")
-
-    # ========================================================================
-    # NEW THESIS VISUALIZATIONS (8-17)
-    # ========================================================================
-    n_plots = 7
-
-    # 8. t-SNE Embeddings
+    # 8. t-SNE
     if embeddings_np is not None:
         try:
             plot_tsne_embeddings(embeddings_np, ground_truth, fig_dir)
             n_plots += 1
         except Exception as e:
-            print(f"  ⚠️ t-SNE plot failed: {e}")
+            print(f"  ⚠️ t-SNE failed: {e}")
 
-    # 9. ROC Curve
+    # 9. ROC curve
+    roc_auc = None
+    roc_fpr = roc_tpr = None
     try:
-        plot_roc_curve(ground_truth, anomaly_scores, fig_dir)
+        roc_auc, roc_fpr, roc_tpr = plot_roc_curve(
+            ground_truth, anomaly_scores, recall, specificity, fig_dir)
+        collected['roc_auc'] = roc_auc
         n_plots += 1
     except Exception as e:
         print(f"  ⚠️ ROC curve failed: {e}")
 
-    # 10. Component Score Comparison
+    # 10. Component scores (corrected d′)
+    dprime_values = {}
     if recon_scores is not None and cluster_scores is not None:
         try:
-            plot_component_score_comparison(recon_scores, energy_scores,
-                                           cluster_scores, ground_truth, fig_dir)
+            dprime_values = plot_component_score_comparison(
+                recon_scores, energy_scores, cluster_scores, ground_truth, fig_dir)
+            collected['dprime'] = dprime_values
             n_plots += 1
         except Exception as e:
-            print(f"  ⚠️ Component score plot failed: {e}")
+            print(f"  ⚠️ Component scores failed: {e}")
 
-    # 11. Ablation Study
+    # 11. Ablation study
+    ablation_results = {}
     if recon_scores is not None and cluster_scores is not None and config is not None:
         try:
-            plot_ablation_study(recon_scores, energy_scores, cluster_scores,
-                                ground_truth, config, fig_dir)
+            ablation_results = plot_ablation_study(
+                recon_scores, energy_scores, cluster_scores, ground_truth,
+                config, fig_dir)
+            collected['ablation'] = ablation_results
             n_plots += 1
         except Exception as e:
             print(f"  ⚠️ Ablation study failed: {e}")
 
-    # 12. Per-Anomaly-Type Detection Rate
+    # 12. Per-type detection
+    per_type_stats = {}
     if anomaly_type_seq is not None:
         try:
-            plot_per_anomaly_type_detection(anomaly_type_seq, predictions,
-                                            ground_truth, fig_dir)
+            per_type_stats = plot_per_anomaly_type_detection(
+                anomaly_type_seq, predictions, ground_truth, fig_dir)
+            collected['per_type'] = per_type_stats
             n_plots += 1
         except Exception as e:
-            print(f"  ⚠️ Per-type detection plot failed: {e}")
+            print(f"  ⚠️ Per-type detection failed: {e}")
 
-    # 13. Cluster Visualization
+    # 13. Cluster visualization
     if embeddings_np is not None and cluster_labels is not None:
         try:
             plot_cluster_visualization(embeddings_np, cluster_labels,
@@ -1604,14 +1620,14 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
         except Exception as e:
             print(f"  ⚠️ Cluster visualization failed: {e}")
 
-    # 14. Threshold Sensitivity
+    # 14. Threshold sensitivity
     try:
         plot_threshold_sensitivity(anomaly_scores, ground_truth, fig_dir)
         n_plots += 1
     except Exception as e:
-        print(f"  ⚠️ Threshold sensitivity plot failed: {e}")
+        print(f"  ⚠️ Threshold sensitivity failed: {e}")
 
-    # 15. Reconstruction Error Heatmap
+    # 15. Reconstruction error heatmap
     if model is not None and test_tensor is not None and feature_names is not None and config is not None:
         try:
             plot_reconstruction_error_heatmap(model, test_tensor, ground_truth,
@@ -1620,15 +1636,17 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
         except Exception as e:
             print(f"  ⚠️ Reconstruction error heatmap failed: {e}")
 
-    # 16. Attention Heatmap
+    # 16. Attention heatmap
+    attn_normal = attn_anomaly = None
     if model is not None and test_tensor is not None and config is not None:
         try:
-            plot_attention_heatmap(model, test_tensor, ground_truth, config, fig_dir)
+            attn_normal, attn_anomaly = plot_attention_heatmap(
+                model, test_tensor, ground_truth, config, fig_dir)
             n_plots += 1
         except Exception as e:
             print(f"  ⚠️ Attention heatmap failed: {e}")
 
-    # 17. Energy Score Landscape
+    # 17. Energy landscape
     if embeddings_np is not None and energy_scores is not None:
         try:
             plot_energy_score_landscape(embeddings_np, energy_scores,
@@ -1637,12 +1655,22 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
         except Exception as e:
             print(f"  ⚠️ Energy landscape failed: {e}")
 
-    print(f"\n✓ All {n_plots} thesis-ready visualizations saved to {fig_dir}/")
-    return fig_dir
+    print(f"\n✓ All {n_plots} figures saved to {fig_dir}/")
+
+    # Return collected data for paper_metrics.json
+    collected['attn_normal'] = attn_normal
+    collected['attn_anomaly'] = attn_anomaly
+    collected['roc_fpr'] = roc_fpr
+    collected['roc_tpr'] = roc_tpr
+    return fig_dir, collected
+
+
 
 
 def main():
     """Main training pipeline"""
+    FS.set_style()
+
     print("="*80)
     print("IMPROVED FULL TRAINING - Production-Ready Anomaly Detection")
     print("Target: F1 > 70%, 100 epochs, stable energy detector, hybrid fusion")
@@ -1753,10 +1781,17 @@ def main():
     val_tensor = torch.FloatTensor(val_data)
     test_tensor = torch.FloatTensor(test_data)
 
+    # Deterministic DataLoader seeding
+    dl_generator = torch.Generator()
+    dl_generator.manual_seed(SEED)
+
     # Autoencoder trains on normal-only data
-    train_loader = DataLoader(TensorDataset(train_normal_tensor), batch_size=ImprovedConfig.BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(TensorDataset(train_normal_tensor),
+                              batch_size=ImprovedConfig.BATCH_SIZE, shuffle=True,
+                              generator=dl_generator)
     # Validation uses ALL data (anomalies increase val loss = good stopping signal)
-    val_loader = DataLoader(TensorDataset(val_tensor), batch_size=ImprovedConfig.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(TensorDataset(val_tensor),
+                            batch_size=ImprovedConfig.BATCH_SIZE, shuffle=False)
 
     # ========================================================================
     # [2] INITIALIZE MODEL
@@ -2260,7 +2295,7 @@ def main():
         if 0 <= local_idx < len(test_gt):
             test_anomaly_type_seq[local_idx] = atype
 
-    generate_thesis_visualizations(
+    fig_dir, viz_collected = generate_thesis_visualizations(
         train_losses, val_losses, train_contrastive, train_reconstruction,
         final_scores, predictions, test_gt, tp, fp, fn, tn,
         precision, recall, f1, accuracy, output_dir,
@@ -2277,6 +2312,83 @@ def main():
     )
 
     # ========================================================================
+    # SAVE figure_data.npz (B2)
+    # ========================================================================
+    print("\nSaving figure_data.npz...")
+    anomaly_type_array = np.array(
+        [test_anomaly_type_seq.get(i, '') for i in range(len(test_gt))],
+        dtype=object
+    )
+    npz_kwargs = dict(
+        recon_scores=recon_scores,
+        cluster_scores=cluster_scores,
+        anomaly_scores=final_scores,
+        ground_truth=test_gt,
+        predictions=predictions.astype(np.int8),
+        anomaly_types=anomaly_type_array,
+        embeddings=embeddings_np,
+        cluster_labels=test_cluster_labels,
+        train_losses=np.array(train_losses),
+        val_losses=np.array(val_losses),
+        train_contrastive=np.array(train_contrastive),
+        train_reconstruction=np.array(train_reconstruction),
+    )
+    if energy_scores is not None:
+        npz_kwargs['energy_scores'] = energy_scores
+    if viz_collected.get('roc_fpr') is not None:
+        npz_kwargs['roc_fpr'] = viz_collected['roc_fpr']
+        npz_kwargs['roc_tpr'] = viz_collected['roc_tpr']
+    if viz_collected.get('attn_normal') is not None:
+        npz_kwargs['attn_normal'] = viz_collected['attn_normal']
+    if viz_collected.get('attn_anomaly') is not None:
+        npz_kwargs['attn_anomaly'] = viz_collected['attn_anomaly']
+    np.savez_compressed(f"{output_dir}/figure_data.npz", **npz_kwargs)
+    print(f"✓ Saved figure_data.npz")
+
+    # ========================================================================
+    # SAVE paper_metrics.json (B3)
+    # ========================================================================
+    print("\nGenerating paper_metrics.json...")
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    paper_metrics = {
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'specificity': float(specificity),
+        'f1': float(f1),
+        'roc_auc': float(viz_collected.get('roc_auc', 0) or 0),
+        'pr_auc': float(viz_collected.get('pr_auc', 0) or 0),
+        'confusion_matrix': {
+            'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)
+        },
+        'detection_method': detection_method,
+        'threshold': float(best_threshold),
+    }
+
+    # Per-type detection rates
+    per_type = viz_collected.get('per_type', {})
+    paper_metrics['per_type_detection'] = {
+        t: {'rate': float(v['rate']), 'total': int(v['total']),
+            'detected': int(v['detected'])}
+        for t, v in per_type.items()
+    }
+
+    # Ablation F1
+    ablation = viz_collected.get('ablation', {})
+    paper_metrics['ablation_f1'] = {
+        k.replace('\n', ' '): float(v) for k, v in ablation.items()
+    }
+
+    # Corrected d-prime per component
+    dprime = viz_collected.get('dprime', {})
+    paper_metrics['dprime'] = {k: float(v) for k, v in dprime.items()}
+
+    with open(f"{output_dir}/paper_metrics.json", 'w') as f:
+        json.dump(paper_metrics, f, indent=2)
+    print(f"✓ Saved paper_metrics.json")
+
+    # ========================================================================
     # DETAILED EXCEL REPORT
     # ========================================================================
     print("\n" + "="*80)
@@ -2285,23 +2397,50 @@ def main():
 
     generate_detailed_results_excel(f"{output_dir}/results.json", output_dir)
 
-    print(f"\n✓ All results, visualizations, and Excel report saved to {output_dir}/")
+    # ========================================================================
+    # FINAL SUMMARY TABLE
+    # ========================================================================
+    print("\n" + "="*80)
+    print("PAPER METRICS SUMMARY")
+    print("="*80)
+    print(f"  {'Metric':<20s} {'Value':>10s}")
+    print(f"  {'-'*20} {'-'*10}")
+    for k in ['accuracy', 'precision', 'recall', 'specificity', 'f1',
+              'roc_auc', 'pr_auc']:
+        print(f"  {k:<20s} {paper_metrics[k]:>10.4f}")
+    print(f"\n  Confusion Matrix:")
+    cm = paper_metrics['confusion_matrix']
+    print(f"    TP: {cm['tp']:>5d}   FP: {cm['fp']:>5d}")
+    print(f"    FN: {cm['fn']:>5d}   TN: {cm['tn']:>5d}")
+
+    if paper_metrics['per_type_detection']:
+        print(f"\n  Per-Type Detection Rates:")
+        for t, v in paper_metrics['per_type_detection'].items():
+            print(f"    {t:<25s}  {v['rate']:.1%}  (detected {v['detected']}/{v['total']})")
+
+    if paper_metrics['ablation_f1']:
+        print(f"\n  Ablation F1 Scores:")
+        for config_name, f1_val in paper_metrics['ablation_f1'].items():
+            print(f"    {config_name:<25s}  {f1_val:.3f}")
+
+    if paper_metrics['dprime']:
+        print(f"\n  Corrected d' (pooled-variance):")
+        for comp, dp in paper_metrics['dprime'].items():
+            print(f"    {comp:<20s}  {FS.d_prime_label(dp)}")
+
+    print(f"\n  Detection Method: {detection_method}")
+    print("="*80)
 
     # Performance assessment
-    print("\n" + "="*80)
     if f1 >= 0.70:
-        print("🎉 EXCELLENT! F1 ≥ 70% - Target achieved!")
+        print("🎉 EXCELLENT! F1 ≥ 70% — Target achieved!")
     elif f1 >= 0.60:
-        print("✅ GOOD! F1 ≥ 60% - Strong performance")
+        print("✅ GOOD! F1 ≥ 60%")
     elif f1 >= 0.50:
-        print("✓ ACCEPTABLE - F1 ≥ 50%")
+        print("✓ ACCEPTABLE — F1 ≥ 50%")
     else:
-        print("⚠️  NEEDS IMPROVEMENT - F1 < 50%")
-        print("\nSuggestions:")
-        print("  1. Train for more epochs (150-200)")
-        print("  2. Adjust anomaly intensity (try 2.5-3.0)")
-        print("  3. Tune RECON_WEIGHT vs ENERGY_WEIGHT")
-        print("  4. Increase model capacity (D_MODEL=256)")
+        print("⚠️  NEEDS IMPROVEMENT — F1 < 50%")
+    print(f"\n✓ All outputs saved to {output_dir}/")
     print("="*80)
 
 

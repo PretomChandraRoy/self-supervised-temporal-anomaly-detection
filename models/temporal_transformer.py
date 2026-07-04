@@ -55,6 +55,7 @@ class TemporalTransformerEncoder(nn.Module):
 
         self.n_features = n_features
         self.d_model = d_model
+        self.dim_feedforward = dim_feedforward
 
         # Input projection
         self.input_projection = nn.Linear(n_features, d_model)
