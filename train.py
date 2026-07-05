@@ -1655,7 +1655,15 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
         except Exception as e:
             print(f"  ⚠️ Energy landscape failed: {e}")
 
+    # 19. Ground Truth vs Predicted Anomaly
+    try:
+        plot_gt_vs_predicted(anomaly_scores, predictions, ground_truth, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ GT vs Predicted failed: {e}")
+
     print(f"\n✓ All {n_plots} figures saved to {fig_dir}/")
+
 
     # Return collected data for paper_metrics.json
     collected['attn_normal'] = attn_normal
@@ -1665,6 +1673,384 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
     return fig_dir, collected
 
 
+def plot_gt_vs_predicted(anomaly_scores, predictions, ground_truth, fig_dir,
+                         n_show=500):
+    """19. Ground Truth vs Predicted Anomaly — 3-panel comparison.
+
+    Panel 1 (top)   : anomaly score line, GT shaded, threshold markers.
+    Panel 2 (middle): binary comparison strip — TP (green), FP (orange),
+                      FN (red), TN (grey).  One vertical bar per sample.
+    Panel 3 (bottom): cumulative TP / FP / FN counts over the sequence.
+    """
+    n = min(n_show, len(anomaly_scores))
+    x = np.arange(n)
+    sc  = np.asarray(anomaly_scores[:n], dtype=float)
+    gt  = np.asarray(ground_truth[:n],   dtype=int)
+    pr  = np.asarray(predictions[:n],    dtype=int)
+
+    # Classify each sample
+    tp_mask = (gt == 1) & (pr == 1)
+    fp_mask = (gt == 0) & (pr == 1)
+    fn_mask = (gt == 1) & (pr == 0)
+    tn_mask = (gt == 0) & (pr == 0)
+
+    # Colour strip values: TP=3, FP=2, FN=1, TN=0
+    strip = np.zeros(n, dtype=int)
+    strip[tp_mask] = 3
+    strip[fp_mask] = 2
+    strip[fn_mask] = 1
+    strip[tn_mask] = 0
+
+    strip_colors = {3: FS.GOOD, 2: FS.ACCENT, 1: FS.BAD, 0: FS.NEUTRAL}
+
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=(14, 7),
+        gridspec_kw={'height_ratios': [3, 0.6, 2]},
+        sharex=True
+    )
+
+    # ── Panel 1: Score line + GT shading ─────────────────────────────────────
+    in_seg = False
+    for i in range(n):
+        if gt[i] == 1 and not in_seg:
+            seg_start = i; in_seg = True
+        if (gt[i] == 0 or i == n - 1) and in_seg:
+            ax1.axvspan(seg_start, i, alpha=0.20, color=FS.ACCENT_L, zorder=0,
+                        label='_nolegend_')
+            in_seg = False
+
+    ax1.plot(x, sc, lw=0.9, color=FS.PRIMARY, alpha=0.85, label='Anomaly Score')
+
+    # Threshold line (median of detected scores as proxy if not passed)
+    thr = sc[pr == 1].min() if pr.any() else sc.mean()
+    ax1.axhline(thr, color=FS.INK, lw=1.0, ls='--', alpha=0.6, label='Threshold')
+
+    # GT anomaly positions
+    true_pos = np.where(gt == 1)[0]
+    if len(true_pos):
+        ax1.scatter(true_pos, sc[true_pos], s=12, c=FS.BAD, marker='o',
+                    edgecolors='none', alpha=0.5, zorder=3, label='Ground Truth Anomaly')
+    # Predicted positions
+    pred_pos = np.where(pr == 1)[0]
+    if len(pred_pos):
+        ax1.scatter(pred_pos, sc[pred_pos], s=25, c=FS.ACCENT, marker='v',
+                    edgecolors=FS.INK, linewidths=0.4, zorder=4, alpha=0.9,
+                    label='Predicted Anomaly')
+
+    ax1.set_ylabel('Anomaly Score')
+    ax1.legend(fontsize=7, loc='upper right', ncol=2)
+    ax1.set_title(f'Ground Truth vs Predicted Anomaly (first {n} samples)')
+
+    # ── Panel 2: Binary comparison strip ─────────────────────────────────────
+    strip_arr = np.array([strip])   # shape (1, n) for imshow
+    cmap_strip = mpl.colors.ListedColormap(
+        [FS.NEUTRAL, FS.BAD, FS.ACCENT, FS.GOOD])   # TN, FN, FP, TP
+    ax2.imshow(strip_arr, aspect='auto', cmap=cmap_strip,
+               vmin=0, vmax=3, extent=[0, n, 0, 1])
+    ax2.set_yticks([])
+    ax2.set_ylabel('TN/FN/FP/TP', fontsize=7, rotation=0, ha='right', va='center')
+
+    # Legend patches for the strip
+    import matplotlib.patches as mpatches
+    patches = [
+        mpatches.Patch(color=FS.GOOD,    label=f'TP ({tp_mask.sum()})'),
+        mpatches.Patch(color=FS.ACCENT,  label=f'FP ({fp_mask.sum()})'),
+        mpatches.Patch(color=FS.BAD,     label=f'FN ({fn_mask.sum()})'),
+        mpatches.Patch(color=FS.NEUTRAL, label=f'TN ({tn_mask.sum()})'),
+    ]
+    ax2.legend(handles=patches, fontsize=7, loc='lower right',
+               ncol=4, framealpha=0.8, handlelength=1.0)
+
+    # ── Panel 3: Cumulative counts ────────────────────────────────────────────
+    cum_tp = np.cumsum(tp_mask)
+    cum_fp = np.cumsum(fp_mask)
+    cum_fn = np.cumsum(fn_mask)
+
+    ax3.fill_between(x, cum_tp, alpha=0.25, color=FS.GOOD)
+    ax3.fill_between(x, cum_fp, alpha=0.25, color=FS.ACCENT)
+    ax3.fill_between(x, cum_fn, alpha=0.25, color=FS.BAD)
+    ax3.plot(x, cum_tp, lw=1.2, color=FS.GOOD,   label='Cumul. TP')
+    ax3.plot(x, cum_fp, lw=1.2, color=FS.ACCENT,  label='Cumul. FP')
+    ax3.plot(x, cum_fn, lw=1.2, color=FS.BAD,    label='Cumul. FN')
+    ax3.set_xlabel('Sample Index')
+    ax3.set_ylabel('Cumulative Count')
+    ax3.legend(fontsize=7, loc='upper left', ncol=3)
+
+    fig.tight_layout(h_pad=0.4)
+    FS.save(fig, f"{fig_dir}/19_gt_vs_predicted")
+    print("  ✓ Saved ground truth vs predicted")
+
+
+def plot_synthetic_anomaly_examples(clean_df, fig_dir):
+    """18. Small-multiples gallery of synthetic anomalies."""
+    import copy
+    
+    types = ['price_spike', 'volatility_spike', 'volume_spike', 
+             'trend_break', 'flash_crash', 'gap_anomaly']
+             
+    segment_len = 80
+    if len(clean_df) < segment_len:
+        print("  ⚠️ Clean segment too short for illustration")
+        return
+        
+    # We need to save the examples
+    out_dict = {'type': [], 'channel': [], 'clean': [], 'perturbed': [], 'span': []}
+
+    fig, axes = plt.subplots(6, 3, figsize=(10, 12), sharex=False, sharey=False)
+    
+    rng = np.random.RandomState(42)  # Fixed seed for reproducibility
+    anomaly_window = getattr(ImprovedConfig, 'ANOMALY_WINDOW', 3)
+    intensity = 2.0
+    
+    # Calculate global std on the clean chunk for scaling
+    price_std = clean_df['close'].std()
+    local_std = price_std
+    
+    for row_idx, anomaly_type in enumerate(types):
+        # We share y-axis within the same row for honest comparison
+        row_min, row_max = float('inf'), float('-inf')
+        
+        # We will generate 3 examples and store them temporarily to compute y-limits
+        row_data = []
+        for col_idx in range(3):
+            # Pick a random starting point for the segment so they look distinct
+            start_idx = rng.randint(0, len(clean_df) - segment_len)
+            base_segment = clean_df.iloc[start_idx : start_idx + segment_len].copy()
+            seg = base_segment.copy()
+            
+            # Ensure tick_volume is float to prevent dtype errors during multiplication
+            if 'tick_volume' in seg.columns:
+                seg['tick_volume'] = seg['tick_volume'].astype(float)
+            
+            # Pick a random injection point within the segment (avoid edges)
+            t_inject = rng.randint(10, segment_len - 10 - anomaly_window)
+            
+            for offset in range(anomaly_window):
+                t = t_inject + offset
+                t_intensity = intensity * (1.0 - 0.075 * offset)
+                
+                if anomaly_type == 'price_spike':
+                    multiplier = rng.uniform(t_intensity, t_intensity + 3.0)
+                    direction = rng.choice([-1, 1])
+                    spike = local_std * multiplier * direction
+                    seg.iloc[t, seg.columns.get_loc('close')] += spike
+                    seg.iloc[t, seg.columns.get_loc('high')] = max(seg.iloc[t]['high'], seg.iloc[t]['close'] + abs(spike) * 0.3)
+                    seg.iloc[t, seg.columns.get_loc('low')] = min(seg.iloc[t]['low'], seg.iloc[t]['close'] - abs(spike) * 0.3)
+    
+                elif anomaly_type == 'volatility_spike':
+                    multiplier = rng.uniform(t_intensity + 2.0, t_intensity + 5.0)
+                    base_range = seg.iloc[t]['high'] - seg.iloc[t]['low']
+                    new_range = base_range * multiplier
+                    mid = (seg.iloc[t]['high'] + seg.iloc[t]['low']) / 2
+                    seg.iloc[t, seg.columns.get_loc('high')] = mid + new_range / 2
+                    seg.iloc[t, seg.columns.get_loc('low')] = mid - new_range / 2
+    
+                elif anomaly_type == 'volume_spike':
+                    multiplier = rng.uniform(t_intensity + 5.0, t_intensity + 15.0)
+                    seg.iloc[t, seg.columns.get_loc('tick_volume')] *= multiplier
+                    price_shift = local_std * t_intensity * 0.8 * rng.choice([-1, 1])
+                    seg.iloc[t, seg.columns.get_loc('close')] += price_shift
+                    range_expansion = abs(price_shift) * 0.5
+                    seg.iloc[t, seg.columns.get_loc('high')] += range_expansion
+                    seg.iloc[t, seg.columns.get_loc('low')] -= range_expansion
+    
+                elif anomaly_type == 'trend_break':
+                    window_start = max(0, t-5)
+                    mean_price = seg.iloc[window_start:t]['close'].mean()
+                    deviation = local_std * t_intensity * 2.0
+                    new_price = mean_price + deviation if rng.rand() > 0.5 else mean_price - deviation
+                    seg.iloc[t, seg.columns.get_loc('close')] = new_price
+                    seg.iloc[t, seg.columns.get_loc('open')] = mean_price
+    
+                elif anomaly_type == 'flash_crash':
+                    crash_depth = local_std * t_intensity * 3.0
+                    seg.iloc[t, seg.columns.get_loc('low')] -= crash_depth
+                    seg.iloc[t, seg.columns.get_loc('close')] -= crash_depth * 0.7
+                    seg.iloc[t, seg.columns.get_loc('open')] -= crash_depth * 0.2
+    
+                elif anomaly_type == 'gap_anomaly':
+                    if t > 0:
+                        prev_close = seg.iloc[t-1]['close']
+                        gap = local_std * t_intensity * 2.5 * rng.choice([-1, 1])
+                        seg.iloc[t, seg.columns.get_loc('open')] = prev_close + gap
+                        seg.iloc[t, seg.columns.get_loc('close')] = prev_close + gap * 0.6
+                        seg.iloc[t, seg.columns.get_loc('high')] = max(seg.iloc[t]['high'], prev_close + abs(gap))
+                        seg.iloc[t, seg.columns.get_loc('low')] = min(seg.iloc[t]['low'], prev_close - abs(gap) * 0.3)
+                        
+            channel = 'tick_volume' if anomaly_type == 'volume_spike' else 'close'
+            clean_arr = base_segment[channel].values
+            pert_arr = seg[channel].values
+            
+            row_min = min(row_min, pert_arr.min())
+            row_max = max(row_max, pert_arr.max())
+            
+            row_data.append({
+                'clean': clean_arr,
+                'perturbed': pert_arr,
+                't_inject': t_inject,
+                'channel': channel
+            })
+            
+            # Save data
+            out_dict['type'].append(anomaly_type)
+            out_dict['channel'].append(channel)
+            out_dict['clean'].append(clean_arr)
+            out_dict['perturbed'].append(pert_arr)
+            out_dict['span'].append([t_inject, t_inject + anomaly_window - 1])
+            
+        # Now plot the 3 columns for this row
+        for col_idx, data in enumerate(row_data):
+            ax = axes[row_idx, col_idx]
+            x = np.arange(segment_len)
+            
+            # Plot perturbed series as thin line
+            ax.plot(x, data['perturbed'], color=FS.PRIMARY, lw=0.9)
+            
+            # Shade injection window
+            ax.axvspan(data['t_inject'] - 0.5, data['t_inject'] + anomaly_window - 0.5, 
+                       color=FS.ACCENT, alpha=0.30, zorder=0)
+            
+            # Style: Strip chart-junk
+            padding = max((row_max - row_min) * 0.05, 1e-6)
+            ax.set_ylim(row_min - padding, row_max + padding)
+            ax.set_yticks([]) # No y-ticks
+            ax.set_xlim(0, segment_len - 1)
+            
+            if col_idx == 0:
+                # Row label
+                ax.set_ylabel(anomaly_type.replace('_', ' ').title(), 
+                              fontsize=10, fontweight='bold', labelpad=10)
+            else:
+                ax.set_ylabel("")
+                
+            if row_idx == 5:
+                if col_idx == 1:
+                    ax.set_xlabel("Time", fontsize=9, labelpad=5)
+            else:
+                ax.set_xlabel("")
+                ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
+                
+    fig.suptitle("Representative synthetic anomalies by type", fontsize=12, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96], h_pad=0.5, w_pad=0.5)
+    
+    FS.save(fig, f"{fig_dir}/18_synthetic_anomaly_examples")
+    print("  ✓ Saved synthetic anomaly examples figure")
+    
+    # Save the underlying arrays
+    np.savez_compressed(
+        f"{fig_dir}/synthetic_examples.npz",
+        type=np.array(out_dict['type'], dtype=object),
+        channel=np.array(out_dict['channel'], dtype=object),
+        clean=np.array(out_dict['clean'], dtype=object),
+        perturbed=np.array(out_dict['perturbed'], dtype=object),
+        span=np.array(out_dict['span'], dtype=object)
+    )
+    print("  ✓ Saved synthetic_examples.npz")
+
+
+def profile_inference(model, sample_batch, device, out_dir):
+    """Profile computational efficiency and save output."""
+    import time
+    
+    model.eval()
+    sample_batch = sample_batch.to(device)
+    
+    # Calculate params
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    
+    # Calculate state dict size (approx)
+    import io
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    size_mb = len(buffer.getvalue()) / (1024 * 1024)
+    
+    def measure_cpu(batch):
+        b = batch.cpu()
+        m = model.cpu()
+        # warm up
+        with torch.no_grad():
+            for _ in range(50):
+                m(b)
+        
+        t0 = time.time()
+        with torch.no_grad():
+            for _ in range(1000):
+                m(b)
+        t1 = time.time()
+        return (t1 - t0) / 1000
+        
+    cpu_b1_lat = measure_cpu(sample_batch[:1])
+    # Batch size 16 for throughput
+    batch_16 = sample_batch[:16] if len(sample_batch) >= 16 else sample_batch.repeat(16, 1, 1)[:16]
+    cpu_b16_lat = measure_cpu(batch_16)
+    cpu_throughput = 16 / cpu_b16_lat
+    
+    gpu_stats = None
+    if torch.cuda.is_available():
+        def measure_gpu(batch):
+            b = batch.to('cuda')
+            m = model.to('cuda')
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                for _ in range(50):
+                    m(b)
+            torch.cuda.synchronize()
+            
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            
+            start.record()
+            with torch.no_grad():
+                for _ in range(1000):
+                    m(b)
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / 1000.0 / 1000.0 # ms to s, then to per pass
+            
+        gpu_b1_lat = measure_gpu(sample_batch[:1])
+        batch_16_gpu = sample_batch[:16] if len(sample_batch) >= 16 else sample_batch.repeat(16, 1, 1)[:16]
+        gpu_b16_lat = measure_gpu(batch_16_gpu)
+        gpu_throughput = 16 / gpu_b16_lat
+        
+        torch.cuda.reset_peak_memory_stats()
+        with torch.no_grad():
+            model.to('cuda')(batch_16_gpu.to('cuda'))
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        
+        gpu_stats = {
+            'latency_b1_ms': gpu_b1_lat * 1000,
+            'latency_b16_ms': gpu_b16_lat * 1000,
+            'throughput_wps': gpu_throughput,
+            'peak_memory_mb': peak_mem
+        }
+        
+    # Put model back on original device
+    model.to(device)
+    
+    results = {
+        'parameters_m': num_params,
+        'state_dict_mb': size_mb,
+        'cpu_latency_b1_ms': cpu_b1_lat * 1000,
+        'cpu_latency_b16_ms': cpu_b16_lat * 1000,
+        'cpu_throughput_wps': cpu_throughput,
+        'gpu': gpu_stats
+    }
+    
+    with open(f"{out_dir}/computational_efficiency.json", 'w') as f:
+        json.dump(results, f, indent=2)
+        
+    tex = f"\\begin{{table}}[h]\n\\centering\n\\caption{{Computational efficiency profile of the trained model.}}\n\\begin{{tabular}}{{lc}}\n\\toprule\nMetric & Value \\\\\n\\midrule\nParameters (M) & {num_params:.2f} \\\\\nModel Size (MB) & {size_mb:.2f} \\\\\nCPU Latency (b=1) & {cpu_b1_lat*1000:.2f} ms \\\\\nCPU Latency (b=16) & {cpu_b16_lat*1000:.2f} ms \\\\\nCPU Throughput & {cpu_throughput:.1f} windows/s \\\\\n"
+    if gpu_stats:
+        tex += f"GPU Latency (b=1) & {gpu_stats['latency_b1_ms']:.2f} ms \\\\\nGPU Latency (b=16) & {gpu_stats['latency_b16_ms']:.2f} ms \\\\\nGPU Throughput & {gpu_stats['throughput_wps']:.1f} windows/s \\\\\nPeak GPU Memory & {gpu_stats['peak_memory_mb']:.1f} MB \\\\\n"
+    else:
+        tex += "GPU Metrics & N/A (CPU-only environment) \\\\\n"
+        
+    tex += "\\bottomrule\n\\end{tabular}\n\\end{table}"
+    
+    with open(f"{out_dir}/computational_efficiency_table.tex", 'w') as f:
+        f.write(tex)
+        
+    print(f"✓ Saved computational efficiency profile (CPU Throughput: {cpu_throughput:.1f} windows/s)")
 
 
 def main():
@@ -1676,10 +2062,11 @@ def main():
     print("Target: F1 > 70%, 100 epochs, stable energy detector, hybrid fusion")
     print("="*80)
 
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"{ImprovedConfig.OUTPUT_DIR}_{timestamp}"
+    output_dir = os.path.abspath(f"{ImprovedConfig.OUTPUT_DIR}_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
 
     # Save config
     config_dict = {k: v for k, v in vars(ImprovedConfig).items() if not k.startswith('_')}
@@ -1692,6 +2079,15 @@ def main():
     print("\n[1/8] Loading and preparing data...")
     df = load_forex_data(ImprovedConfig.DATA_PATH)
     print(f"Loaded {len(df)} rows")
+    
+    # 18. Illustrative examples of synthetic anomalies
+    try:
+        clean_slice = df.iloc[100:2000] # Large clean segment to sample from
+        fig_dir = f"{output_dir}/thesis_figures"
+        os.makedirs(fig_dir, exist_ok=True)
+        plot_synthetic_anomaly_examples(clean_slice, fig_dir)
+    except Exception as e:
+        print(f"  ⚠️ Synthetic anomaly examples failed: {e}")
 
     # Inject diverse anomalies
     df_with_anomalies, ground_truth, anomaly_type_map = inject_diverse_anomalies(
@@ -2396,6 +2792,43 @@ def main():
     print("="*80)
 
     generate_detailed_results_excel(f"{output_dir}/results.json", output_dir)
+    
+    # ========================================================================
+    # INFERENCE PROFILING & MANIFEST
+    # ========================================================================
+    try:
+        profile_inference(model, test_tensor[:16], ImprovedConfig.DEVICE, output_dir)
+    except Exception as e:
+        print(f"  ⚠️ Inference profiling failed: {e}")
+        
+    manifest = {
+        "main": [
+            "Model Arcitecture.jpeg",
+            "18_synthetic_anomaly_examples",
+            "6_detection_timeline",
+            "2_confusion_matrix",
+            "9_roc_curve", "5_precision_recall_curve",
+            "12_per_type_detection",
+            "11_ablation_study",
+            "8_tsne_embeddings",
+            "16_attention_heatmap",
+            "10_component_scores"
+        ],
+        "supplementary": [
+            "1_training_curves",
+            "13_cluster_visualization", "17_energy_landscape",
+            "14_threshold_sensitivity",
+            "15_reconstruction_error_heatmap"
+        ],
+        "cut": [
+            "3_performance_metrics",
+            "4_anomaly_score_distribution",
+            "7_results_dashboard"
+        ]
+    }
+    with open(f"{output_dir}/figure_manifest.json", 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"✓ Saved figure_manifest.json")
 
     # ========================================================================
     # FINAL SUMMARY TABLE
