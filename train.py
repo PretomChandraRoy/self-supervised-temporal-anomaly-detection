@@ -13,10 +13,18 @@ import pandas as pd
 import os
 import sys
 import json
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+
+# Ensure UTF-8 stdout encoding for Windows terminals printing checkmarks/emojis
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # ---- Reproducibility ----
 SEED = 42
@@ -124,6 +132,12 @@ class ImprovedConfig:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     OUTPUT_DIR = 'improved_outputs'
     EARLY_STOPPING_PATIENCE = 40  # Allow more patience for slow convergence
+
+    # New architectural blocks (support env vars for toggle testing)
+    USE_MSTC = os.environ.get('USE_MSTC', 'True') == 'True'
+    USE_HRG = os.environ.get('USE_HRG', 'True') == 'True'
+    USE_GATED_HEAD = os.environ.get('USE_GATED_HEAD', 'True') == 'True'
+    RUN_ABLATION = os.environ.get('RUN_ABLATION', 'True') == 'True'
 
     # Reporting
     SAVE_PLOTS = True
@@ -296,7 +310,10 @@ def train_energy_detector_stable(energy_detector, train_tensor, train_gt, embedd
     # Create a DataLoader that includes ground truth labels to avoid shuffle misalignment
     gt_tensor = torch.FloatTensor(train_gt.astype(np.float32))
     energy_dataset = TensorDataset(train_tensor, gt_tensor)
-    energy_loader = DataLoader(energy_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+    energy_dl_gen = torch.Generator()
+    energy_dl_gen.manual_seed(SEED)
+    energy_loader = DataLoader(energy_dataset, batch_size=config.BATCH_SIZE,
+                               shuffle=True, generator=energy_dl_gen)
 
     n_anomalies = train_gt.sum()
     n_normal = len(train_gt) - n_anomalies
@@ -805,36 +822,69 @@ def plot_training_curves(train_losses, val_losses, train_contrastive,
     print("  ✓ Saved training curves")
 
 
-def plot_confusion_matrix(tp, fp, fn, tn, precision, recall, f1, accuracy,
+def plot_confusion_matrix(predictions, ground_truth, anomaly_type_seq,
+                          tp, fp, fn, tn, precision, recall, f1, accuracy,
                           fig_dir):
-    """2. Confusion matrix — sequential blue, counts + row-normalised %, metric strip."""
+    """2. Confusion matrix — broken down by anomaly type (7x2)."""
     import matplotlib.gridspec as gridspec
 
-    cm = np.array([[tn, fp], [fn, tp]])
+    # Determine unique anomaly types
+    types = []
+    if anomaly_type_seq is not None:
+        types = sorted(list(set([v for k,v in anomaly_type_seq.items() if ground_truth[k] == 1])))
+    
+    # We want 1 row for Normal, plus 1 row for each type.
+    row_labels = ['Normal'] + [t.replace('_', ' ').title() for t in types]
+    cm = np.zeros((len(row_labels), 2), dtype=int)
+    
+    # Fill Normal row
+    cm[0, 0] = tn  # Actual Normal, Predicted Normal
+    cm[0, 1] = fp  # Actual Normal, Predicted Anomaly
+    
+    # Fill Anomaly rows
+    for i, t in enumerate(types):
+        t_indices = [k for k, v in anomaly_type_seq.items() if ground_truth[k] == 1 and v == t]
+        t_pred = predictions[t_indices]
+        t_fn = np.sum(t_pred == 0)
+        t_tp = np.sum(t_pred == 1)
+        cm[i+1, 0] = t_fn
+        cm[i+1, 1] = t_tp
+
+    # If some ground truth anomalies lack a type mapping, put them in an "Unknown Anomaly" row
+    mapped_anomalies = sum([cm[i, 0] + cm[i, 1] for i in range(1, len(row_labels))])
+    total_anomalies = tp + fn
+    if mapped_anomalies < total_anomalies:
+        diff_fn = fn - sum([cm[i, 0] for i in range(1, len(row_labels))])
+        diff_tp = tp - sum([cm[i, 1] for i in range(1, len(row_labels))])
+        cm = np.vstack([cm, [diff_fn, diff_tp]])
+        row_labels.append('Unknown Anomaly')
+
     row_sums = cm.sum(axis=1, keepdims=True)
     cm_pct = cm / (row_sums + 1e-8) * 100
 
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
-    fig = plt.figure(figsize=(6, 5.5))
-    gs = gridspec.GridSpec(2, 1, height_ratios=[5, 0.7], hspace=0.25)
+    fig = plt.figure(figsize=(7, max(6.0, 3.5 + 0.5 * len(row_labels))))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[len(row_labels)*0.8, 1.2], hspace=0.20)
     ax = fig.add_subplot(gs[0])
     ax_strip = fig.add_subplot(gs[1])
 
     # Heatmap
     im = ax.imshow(cm, cmap=FS.SEQ_BLUE_CMAP, aspect='auto')
-    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(['Normal', 'Anomaly'])
-    ax.set_yticklabels(['Normal', 'Anomaly'])
-    ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
-    ax.set_title('Confusion Matrix')
+    ax.set_xticks([0, 1])
+    ax.set_yticks(np.arange(len(row_labels)))
+    ax.set_xticklabels(['Normal (0)', 'Anomaly (1)'])
+    ax.set_yticklabels(row_labels)
+    ax.set_xlabel('Predicted Class')
+    ax.set_ylabel('Actual Class')
+    ax.set_title('Confusion Matrix (Breakdown by Type)')
 
     # Annotate each cell: count + row %
-    for i in range(2):
+    for i in range(len(row_labels)):
         for j in range(2):
             color = 'white' if cm[i, j] > cm.max() * 0.6 else FS.INK
             ax.text(j, i, f"{cm[i, j]}\n({cm_pct[i, j]:.1f}%)",
-                    ha='center', va='center', fontsize=12, fontweight='bold',
+                    ha='center', va='center', fontsize=10, fontweight='bold',
                     color=color)
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
@@ -844,16 +894,102 @@ def plot_confusion_matrix(tp, fp, fn, tn, precision, recall, f1, accuracy,
     ax_strip.axis('off')
     strip_text = (f"Accuracy {accuracy:.3f}  │  "
                   f"Precision {precision:.3f}  │  "
-                  f"Recall {recall:.3f}  │  "
+                  f"Recall {recall:.3f}\n"
                   f"Specificity {specificity:.3f}  │  "
                   f"F1 {f1:.3f}")
     ax_strip.text(0.5, 0.5, strip_text, ha='center', va='center',
-                  fontsize=9.5, family='monospace',
+                  fontsize=10, family='monospace',
                   transform=ax_strip.transAxes,
-                  bbox=dict(boxstyle='round,pad=0.4', facecolor=FS.GRID, edgecolor='none'))
+                  bbox=dict(boxstyle='round,pad=0.5', facecolor=FS.GRID, edgecolor='none'))
 
     FS.save(fig, f"{fig_dir}/2_confusion_matrix")
-    print("  ✓ Saved confusion matrix")
+    print("  ✓ Saved confusion matrix (7x2 breakdown)")
+
+def plot_multi_threshold_confusion_matrix(anomaly_scores, ground_truth, fig_dir):
+    """2c. Multi-Threshold Confusion Matrix Grid (4x4)."""
+    # Pick 16 thresholds spanning from the 50th percentile to the 99.9th percentile of scores
+    min_score = np.percentile(anomaly_scores, 50)
+    max_score = np.percentile(anomaly_scores, 99.9)
+    thresholds = np.linspace(min_score, max_score, 16)
+    
+    fig, axes = plt.subplots(4, 4, figsize=(12, 12), sharex=True, sharey=True)
+    axes = axes.flatten()
+    
+    for i, threshold in enumerate(thresholds):
+        ax = axes[i]
+        predictions = (anomaly_scores > threshold).astype(int)
+        
+        tp = np.sum((predictions == 1) & (ground_truth == 1))
+        fp = np.sum((predictions == 1) & (ground_truth == 0))
+        fn = np.sum((predictions == 0) & (ground_truth == 1))
+        tn = np.sum((predictions == 0) & (ground_truth == 0))
+        
+        cm = np.array([[tn, fp], [fn, tp]])
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_pct = cm / (row_sums + 1e-8) * 100
+        
+        im = ax.imshow(cm, cmap=FS.SEQ_BLUE_CMAP, aspect='auto', vmin=0, vmax=len(ground_truth))
+        
+        # Annotate
+        for r in range(2):
+            for c in range(2):
+                color = 'white' if cm[r, c] > cm.max() * 0.6 else FS.INK
+                ax.text(c, r, f"{cm[r, c]}\n({cm_pct[r, c]:.0f}%)",
+                        ha='center', va='center', fontsize=9, fontweight='bold', color=color)
+        
+        ax.set_title(f"Threshold: {threshold:.3f}", fontsize=10)
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        if i >= 12:
+            ax.set_xticklabels(['N', 'A'])
+            ax.set_xlabel('Predicted')
+        if i % 4 == 0:
+            ax.set_yticklabels(['N', 'A'])
+            ax.set_ylabel('Actual')
+            
+    fig.suptitle('Confusion Matrix Evolution Across Thresholds', fontsize=14, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    FS.save(fig, f"{fig_dir}/2c_multi_threshold_cm")
+    print("  ✓ Saved multi-threshold confusion matrix grid")
+
+
+def plot_quadrant_dashboard(tp, fp, fn, tn, fig_dir):
+    """2b. Quadrant Visualization (Infographic Dashboard)."""
+    import matplotlib.patches as patches
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    fig.patch.set_facecolor(FS.BG)
+    
+    quadrants = [
+        {'ax': axes[0, 0], 'title': 'TRUE NEGATIVES', 'subtitle': 'Normal behavior ignored', 'val': tn, 'color': FS.GOOD},
+        {'ax': axes[0, 1], 'title': 'FALSE POSITIVES', 'subtitle': 'Normal flagged (False Alarm)', 'val': fp, 'color': FS.ACCENT},
+        {'ax': axes[1, 0], 'title': 'FALSE NEGATIVES', 'subtitle': 'Anomalies missed by model', 'val': fn, 'color': FS.BAD},
+        {'ax': axes[1, 1], 'title': 'TRUE POSITIVES', 'subtitle': 'Anomalies correctly caught', 'val': tp, 'color': FS.PRIMARY}
+    ]
+    
+    for q in quadrants:
+        ax = q['ax']
+        ax.axis('off')
+        
+        # Draw background rounded rectangle
+        rect = patches.FancyBboxPatch((0.05, 0.05), 0.9, 0.9, boxstyle="round,pad=0.02,rounding_size=0.05",
+                                      linewidth=1.5, edgecolor=q['color'], facecolor=q['color'], alpha=0.1,
+                                      transform=ax.transAxes)
+        ax.add_patch(rect)
+        
+        # Add value text
+        ax.text(0.5, 0.52, f"{q['val']:,}", fontsize=54, fontweight='bold',
+                ha='center', va='center', color=q['color'])
+                
+        # Add Title and Subtitle
+        ax.text(0.5, 0.82, q['title'], fontsize=14, fontweight='bold',
+                ha='center', va='center', color=FS.INK)
+        ax.text(0.5, 0.22, q['subtitle'], fontsize=12, style='italic',
+                ha='center', va='center', color=FS.MUTED)
+        
+    fig.suptitle('Detection Quadrant Breakdown', fontsize=18, fontweight='bold', y=0.96, color=FS.INK)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    FS.save(fig, f"{fig_dir}/2b_quadrant_dashboard")
+    print("  ✓ Saved quadrant dashboard")
 
 
 def plot_performance_metrics(precision, recall, f1, accuracy, fig_dir):
@@ -1512,11 +1648,26 @@ def generate_thesis_visualizations(train_losses, val_losses, train_contrastive,
 
     # 2. Confusion matrix
     try:
-        plot_confusion_matrix(tp, fp, fn, tn, precision, recall, f1, accuracy,
+        plot_confusion_matrix(predictions, ground_truth, anomaly_type_seq,
+                              tp, fp, fn, tn, precision, recall, f1, accuracy,
                               fig_dir)
         n_plots += 1
     except Exception as e:
         print(f"  ⚠️ Confusion matrix failed: {e}")
+
+    # 2c. Multi-threshold CM Grid
+    try:
+        plot_multi_threshold_confusion_matrix(anomaly_scores, ground_truth, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Multi-threshold CM grid failed: {e}")
+
+    # 2b. Quadrant Dashboard
+    try:
+        plot_quadrant_dashboard(tp, fp, fn, tn, fig_dir)
+        n_plots += 1
+    except Exception as e:
+        print(f"  ⚠️ Quadrant dashboard failed: {e}")
 
     # 3. Performance metrics
     try:
@@ -1948,7 +2099,7 @@ def plot_synthetic_anomaly_examples(clean_df, fig_dir):
     print("  ✓ Saved synthetic_examples.npz")
 
 
-def profile_inference(model, sample_batch, device, out_dir):
+def profile_inference(model, sample_batch, device, out_dir, base_params_m=None):
     """Profile computational efficiency and save output."""
     import time
     
@@ -2035,11 +2186,16 @@ def profile_inference(model, sample_batch, device, out_dir):
         'cpu_throughput_wps': cpu_throughput,
         'gpu': gpu_stats
     }
+    if base_params_m is not None:
+        results['base_parameters_m'] = base_params_m
+        results['added_parameters_m'] = round(num_params - base_params_m, 4)
     
     with open(f"{out_dir}/computational_efficiency.json", 'w') as f:
         json.dump(results, f, indent=2)
         
     tex = f"\\begin{{table}}[h]\n\\centering\n\\caption{{Computational efficiency profile of the trained model.}}\n\\begin{{tabular}}{{lc}}\n\\toprule\nMetric & Value \\\\\n\\midrule\nParameters (M) & {num_params:.2f} \\\\\nModel Size (MB) & {size_mb:.2f} \\\\\nCPU Latency (b=1) & {cpu_b1_lat*1000:.2f} ms \\\\\nCPU Latency (b=16) & {cpu_b16_lat*1000:.2f} ms \\\\\nCPU Throughput & {cpu_throughput:.1f} windows/s \\\\\n"
+    if base_params_m is not None:
+        tex += f"Base Parameters (M) & {base_params_m:.2f} \\\\\nAdded Parameters (M) & {num_params - base_params_m:.2f} \\\\\n"
     if gpu_stats:
         tex += f"GPU Latency (b=1) & {gpu_stats['latency_b1_ms']:.2f} ms \\\\\nGPU Latency (b=16) & {gpu_stats['latency_b16_ms']:.2f} ms \\\\\nGPU Throughput & {gpu_stats['throughput_wps']:.1f} windows/s \\\\\nPeak GPU Memory & {gpu_stats['peak_memory_mb']:.1f} MB \\\\\n"
     else:
@@ -2051,6 +2207,613 @@ def profile_inference(model, sample_batch, device, out_dir):
         f.write(tex)
         
     print(f"✓ Saved computational efficiency profile (CPU Throughput: {cpu_throughput:.1f} windows/s)")
+    return results
+
+
+# =========================================================================
+# GUIDANCE MAP FIGURE (19)
+# =========================================================================
+
+def plot_guidance_map(model, test_tensor, test_gt, anomaly_type_seq,
+                      fig_dir, config):
+    """19. Guidance map: close series + guidance map g for anomaly/normal windows.
+
+    Returns dict with guidance statistics for paper_metrics.json, and saves
+    guidance_examples.npz for reproducible re-plotting.
+    """
+    if model.encoder.hrg is None:
+        print("  ⚠️ HRG disabled, skipping guidance map figure")
+        return {}
+
+    model.eval()
+    device = config.DEVICE
+
+    # Find anomaly and normal window indices
+    anom_indices = np.where(test_gt == 1)[0]
+    norm_indices = np.where(test_gt == 0)[0]
+
+    if len(anom_indices) < 3:
+        print("  ⚠️ Not enough anomaly windows for guidance map")
+        return {}
+
+    # Select 4 anomaly windows + 2 normal windows
+    rng = np.random.RandomState(SEED)
+    sel_anom = rng.choice(anom_indices, size=min(4, len(anom_indices)), replace=False)
+    sel_norm = rng.choice(norm_indices, size=min(2, len(norm_indices)), replace=False)
+    selected = np.concatenate([sel_anom, sel_norm])
+
+    n_panels = len(selected)
+    fig, axes = plt.subplots(n_panels, 2, figsize=(14, 2.8 * n_panels),
+                              gridspec_kw={'width_ratios': [3, 1]})
+    if n_panels == 1:
+        axes = axes.reshape(1, -1)
+
+    # Collect raw arrays for npz
+    all_series, all_guidance, all_spans, all_is_anom, all_widx = [], [], [], [], []
+
+    # Compute guidance maps for selected windows
+    for row_idx, widx in enumerate(selected):
+        x = test_tensor[widx:widx+1].to(device)
+
+        with torch.no_grad():
+            _ = model.encoder(x)  # triggers HRG, stores guidance map
+            g = model.get_guidance_map()  # (1, 1, T)
+
+        g_np = g[0, 0].cpu().numpy()     # (T,)
+        series_np = test_tensor[widx, :, 0].numpy()  # close channel = feature 0
+
+        is_anom = bool(test_gt[widx])
+
+        # Determine anomaly span within the window (last ANOMALY_WINDOW timesteps for last-point labeling)
+        anom_window = getattr(config, 'ANOMALY_WINDOW', 3)
+        if is_anom:
+            span = (len(series_np) - anom_window, len(series_np) - 1)
+        else:
+            span = (-1, -1)  # no anomaly
+
+        # Store for npz
+        all_series.append(series_np)
+        all_guidance.append(g_np)
+        all_spans.append(span)
+        all_is_anom.append(is_anom)
+        all_widx.append(int(widx))
+
+        # --- Left panel: close series + anomaly shading ---
+        ax_series = axes[row_idx, 0]
+        t = np.arange(len(series_np))
+        ax_series.plot(t, series_np, lw=1.0, color=FS.PRIMARY)
+
+        if is_anom and span[0] >= 0:
+            ax_series.axvspan(span[0], span[1], alpha=0.3, color=FS.ACCENT_L,
+                              label='Injected anomaly')
+
+        label = 'Anomaly' if is_anom else 'Normal'
+        atype = anomaly_type_seq.get(widx, '')
+        title_suffix = f" ({atype})" if atype else ""
+        ax_series.set_ylabel(f'{label}{title_suffix}', fontsize=9)
+        if row_idx == 0:
+            ax_series.set_title('Close Series (scaled)')
+        if row_idx == n_panels - 1:
+            ax_series.set_xlabel('Timestep')
+
+        # --- Right panel: guidance map as heat strip ---
+        ax_guide = axes[row_idx, 1]
+        ax_guide.imshow(g_np.reshape(1, -1), aspect='auto', cmap='hot',
+                        vmin=0, vmax=1, extent=[0, len(g_np), 0, 1])
+        if is_anom and span[0] >= 0:
+            ax_guide.axvline(span[0], color=FS.ACCENT, lw=1.5, ls='--')
+            ax_guide.axvline(span[1], color=FS.ACCENT, lw=1.5, ls='--')
+        ax_guide.set_yticks([])
+        if row_idx == 0:
+            ax_guide.set_title('Guidance g ∈ [0,1]')
+        if row_idx == n_panels - 1:
+            ax_guide.set_xlabel('Timestep')
+        ax_guide.grid(False)
+
+    fig.suptitle('Temporal Guidance Map (HRG)', fontsize=13, fontweight='bold', y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    FS.save(fig, f"{fig_dir}/19_guidance_map")
+    print("  ✓ Saved guidance map figure")
+
+    # Save npz
+    np.savez_compressed(
+        f"{fig_dir}/guidance_examples.npz",
+        series=np.array(all_series, dtype=object),
+        guidance=np.array(all_guidance, dtype=object),
+        span=np.array(all_spans),
+        is_anomaly=np.array(all_is_anom),
+        window_index=np.array(all_widx),
+    )
+    print("  ✓ Saved guidance_examples.npz")
+
+    # --- Position-controlled guidance statistics ---
+    # Every anomaly sits at steps 57-59 (last ANOMALY_WINDOW steps of a 60-step
+    # window due to last-point labeling).  The old "inside anomaly span vs outside"
+    # comparison actually measured edge-vs-interior — a positional artifact.
+    #
+    # Position-controlled test: compare guidance at the SAME position (57-59) for
+    # anomalous vs normal windows, and use a mid-window control (28-30) to detect
+    # positional bias.  Raw numbers are reported without interpretation.
+    print("  Computing position-controlled guidance statistics...")
+    anom_window = getattr(config, 'ANOMALY_WINDOW', 3)
+    window_len = test_tensor.shape[1]  # 60
+    anom_start = window_len - anom_window  # 57
+    anom_end = window_len  # 60
+    mid_start = window_len // 2 - 1  # 28
+    mid_end = mid_start + anom_window  # 31
+
+    g_5759_anom, g_5759_norm = [], []
+    g_mid_anom, g_mid_norm = [], []
+    all_g_arrays = []  # per-window guidance for reproducibility
+
+    batch_size = 64
+    for start_idx in range(0, len(test_tensor), batch_size):
+        end_idx = min(start_idx + batch_size, len(test_tensor))
+        batch = test_tensor[start_idx:end_idx].to(device)
+        with torch.no_grad():
+            _ = model.encoder(batch)
+            g_batch = model.get_guidance_map()  # (B, 1, T)
+        if g_batch is None:
+            break
+        g_batch_np = g_batch[:, 0, :].cpu().numpy()  # (B, T)
+
+        for i in range(end_idx - start_idx):
+            global_idx = start_idx + i
+            g_arr = g_batch_np[i]
+            all_g_arrays.append(g_arr)
+
+            g_tail = float(g_arr[anom_start:anom_end].mean())
+            g_mid = float(g_arr[mid_start:mid_end].mean())
+
+            if test_gt[global_idx] == 1:
+                g_5759_anom.append(g_tail)
+                g_mid_anom.append(g_mid)
+            else:
+                g_5759_norm.append(g_tail)
+                g_mid_norm.append(g_mid)
+
+    guidance_stats = {}
+    if g_5759_anom and g_5759_norm:
+        guidance_stats = {
+            'mean_g_5759_anomaly': float(np.mean(g_5759_anom)),
+            'mean_g_5759_normal': float(np.mean(g_5759_norm)),
+            'mean_g_mid_anomaly': float(np.mean(g_mid_anom)),
+            'mean_g_mid_normal': float(np.mean(g_mid_norm)),
+            'g_5759_delta': float(np.mean(g_5759_anom) - np.mean(g_5759_norm)),
+            'g_mid_delta': float(np.mean(g_mid_anom) - np.mean(g_mid_norm)),
+            'n_anomaly_windows': len(g_5759_anom),
+            'n_normal_windows': len(g_5759_norm),
+        }
+        print(f"    g at steps {anom_start}-{anom_end-1} (anomaly position):")
+        print(f"      Anomaly windows: {guidance_stats['mean_g_5759_anomaly']:.4f}")
+        print(f"      Normal windows:  {guidance_stats['mean_g_5759_normal']:.4f}")
+        print(f"      Delta:           {guidance_stats['g_5759_delta']:+.4f}")
+        print(f"    g at steps {mid_start}-{mid_end-1} (mid-window control):")
+        print(f"      Anomaly windows: {guidance_stats['mean_g_mid_anomaly']:.4f}")
+        print(f"      Normal windows:  {guidance_stats['mean_g_mid_normal']:.4f}")
+        print(f"      Delta:           {guidance_stats['g_mid_delta']:+.4f}")
+
+    # Save per-window guidance arrays for reproducible re-analysis
+    np.savez_compressed(
+        f"{fig_dir}/guidance_all_windows.npz",
+        guidance=np.array(all_g_arrays),
+        is_anomaly=test_gt.astype(np.int8),
+    )
+
+    return guidance_stats
+
+
+# =========================================================================
+# ARCHITECTURE ABLATION (11b)
+# =========================================================================
+
+def run_single_ablation_config(config_name, use_mstc, use_hrg, use_gated_head,
+                                train_normal_data, train_data, train_gt,
+                                val_data, val_gt, test_data, test_gt,
+                                n_features, feature_names, config):
+    """Train and evaluate a single ablation configuration.
+
+    Returns dict with f1, precision, recall, roc_auc, and epochs_trained.
+    """
+    print(f"\n{'='*60}")
+    print(f"ABLATION: {config_name}")
+    print(f"  MSTC={use_mstc}, HRG={use_hrg}, GatedHead={use_gated_head}")
+    print(f"{'='*60}")
+
+    # Reset all random state for this config
+    import random as _random
+    _random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    # Build model
+    abl_model = SelfSupervisedTemporalModel(
+        n_features=n_features,
+        d_model=config.D_MODEL,
+        n_heads=config.N_HEADS,
+        n_layers=config.N_LAYERS,
+        dropout=config.DROPOUT,
+        mask_ratio=config.MASK_RATIO,
+        contrastive_weight=config.CONTRASTIVE_WEIGHT,
+        reconstruction_weight=config.RECONSTRUCTION_WEIGHT,
+        use_mstc=use_mstc,
+        use_hrg=use_hrg,
+    ).to(config.DEVICE)
+
+    n_params = sum(p.numel() for p in abl_model.parameters())
+    print(f"  Parameters: {n_params:,}")
+
+    # Train
+    train_normal_tensor = torch.FloatTensor(train_normal_data)
+    train_tensor_abl = torch.FloatTensor(train_data)
+    val_tensor_abl = torch.FloatTensor(val_data)
+    test_tensor_abl = torch.FloatTensor(test_data)
+
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(SEED)
+    train_loader = DataLoader(TensorDataset(train_normal_tensor),
+                              batch_size=config.BATCH_SIZE, shuffle=True,
+                              generator=dl_gen)
+    val_loader = DataLoader(TensorDataset(val_tensor_abl),
+                            batch_size=config.BATCH_SIZE, shuffle=False)
+
+    abl_optimizer = optim.AdamW(abl_model.parameters(), lr=config.LEARNING_RATE,
+                            weight_decay=config.WEIGHT_DECAY)
+    abl_scheduler = optim.lr_scheduler.CosineAnnealingLR(abl_optimizer,
+                                                      T_max=config.N_EPOCHS,
+                                                      eta_min=1e-6)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_state = None
+    epochs_trained = 0
+
+    for epoch in range(config.N_EPOCHS):
+        abl_model.train()
+        for x, in train_loader:
+            x = x.to(config.DEVICE)
+            abl_optimizer.zero_grad()
+            loss, _ = abl_model(x, use_contrastive=True, use_reconstruction=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(abl_model.parameters(), config.GRADIENT_CLIP)
+            abl_optimizer.step()
+
+        abl_model.eval()
+        val_losses_abl = []
+        with torch.no_grad():
+            for x, in val_loader:
+                x = x.to(config.DEVICE)
+                loss, _ = abl_model(x, use_contrastive=True, use_reconstruction=True)
+                val_losses_abl.append(loss.item())
+
+        avg_val = np.mean(val_losses_abl)
+        abl_scheduler.step()
+        epochs_trained = epoch + 1
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            patience_counter = 0
+            best_state = {k: v.cpu().clone() for k, v in abl_model.state_dict().items()}
+        else:
+            patience_counter += 1
+            if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+                print(f"  Early stopped at epoch {epochs_trained}")
+                break
+
+        if (epoch + 1) % 25 == 0:
+            print(f"  Epoch {epoch+1}: val_loss={avg_val:.4f}")
+
+    # Load best
+    if best_state is not None:
+        abl_model.load_state_dict(best_state)
+    abl_model.to(config.DEVICE)
+    abl_model.eval()
+
+    # --- Clustering ---
+    with torch.no_grad():
+        train_normal_emb = abl_model.get_embeddings(
+            train_normal_tensor.to(config.DEVICE)).cpu().numpy()
+        train_emb = abl_model.get_embeddings(
+            train_tensor_abl.to(config.DEVICE)).cpu().numpy()
+
+    abl_clustering = DensityAwareClustering(n_clusters=config.N_CLUSTERS,
+                                         min_cluster_size=config.MIN_CLUSTER_SIZE)
+    abl_clustering.fit(train_normal_emb)
+    cluster_labels_abl = abl_clustering.predict(train_emb)
+
+    # --- Latent space regularization (identical to main pipeline step 4b) ---
+    abl_regularizer = LatentSpaceRegularizer(
+        embedding_dim=config.D_MODEL,
+        n_clusters=config.N_CLUSTERS,
+        alpha=0.5
+    ).to(config.DEVICE)
+
+    # Initialize centers from K-Means results
+    with torch.no_grad():
+        for k in range(config.N_CLUSTERS):
+            mask = cluster_labels_abl == k
+            if mask.sum() > 0:
+                abl_regularizer.centers.data[k] = torch.FloatTensor(
+                    train_emb[mask].mean(axis=0)
+                ).to(config.DEVICE)
+
+    reg_optimizer = optim.AdamW(
+        list(abl_model.parameters()) + list(abl_regularizer.parameters()),
+        lr=config.REGULARIZATION_LR,
+        weight_decay=config.WEIGHT_DECAY
+    )
+
+    abl_model.train()
+    normal_cl = abl_clustering.predict(train_normal_emb)
+    reg_loader = DataLoader(
+        TensorDataset(train_normal_tensor, torch.LongTensor(normal_cl)),
+        batch_size=config.BATCH_SIZE, shuffle=True
+    )
+
+    for reg_epoch in range(config.REGULARIZATION_EPOCHS):
+        for x_batch, cl_batch in reg_loader:
+            x_batch = x_batch.to(config.DEVICE)
+            cl_batch = cl_batch.to(config.DEVICE)
+            reg_optimizer.zero_grad()
+            recon_loss_val, _ = abl_model(x_batch, use_contrastive=False,
+                                          use_reconstruction=True)
+            emb = abl_model.get_embeddings(x_batch)
+            reg_loss = abl_regularizer(emb, cl_batch)
+            total_loss = recon_loss_val + config.REGULARIZATION_WEIGHT * reg_loss
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(abl_model.parameters(),
+                                           config.GRADIENT_CLIP)
+            reg_optimizer.step()
+            abl_regularizer.update_centers(emb.detach(), cl_batch)
+
+    # Re-extract and re-cluster with regularized embeddings
+    abl_model.eval()
+    with torch.no_grad():
+        train_emb = abl_model.get_embeddings(
+            train_tensor_abl.to(config.DEVICE)).cpu().numpy()
+        train_normal_emb = abl_model.get_embeddings(
+            train_normal_tensor.to(config.DEVICE)).cpu().numpy()
+    abl_clustering.fit(train_normal_emb)
+    cluster_labels_abl = abl_clustering.predict(train_emb)
+    print(f"  Regularization + re-clustering done")
+
+    # --- Reconstruction detector ---
+    price_sensitive = {'close', 'open', 'high', 'low', 'returns', 'log_returns',
+                       'high_low_range', 'close_open_range', 'atr', 'atr_pct'}
+    slow_indicators = {'sma_20', 'sma_50', 'ema_12', 'ema_26', 'adx',
+                       'bb_high', 'bb_low', 'bb_position'}
+    fw = []
+    for fname in feature_names:
+        if fname.lower() in price_sensitive:
+            fw.append(3.0)
+        elif fname.lower() in slow_indicators:
+            fw.append(0.0)
+        else:
+            fw.append(1.0)
+    fw_tensor = torch.FloatTensor(fw)
+
+    abl_recon_detector = ReconstructionBasedDetector(
+        reconstructor=abl_model.reconstructor, threshold_percentile=95,
+        feature_weights=fw_tensor)
+    abl_recon_detector.fit(train_normal_tensor.to(config.DEVICE))
+
+    # --- Energy detector ---
+    abl_energy_detector = None
+    if config.USE_ENERGY_DETECTOR:
+        abl_energy_detector = EnergyBasedAnomalyDetector(
+            embedding_dim=config.D_MODEL, n_clusters=config.N_CLUSTERS,
+            use_gated_head=use_gated_head).to(config.DEVICE)
+
+        success = train_energy_detector_stable(abl_energy_detector, train_tensor_abl,
+                                               train_gt, abl_model, config)
+        if success:
+            with torch.no_grad():
+                train_emb_t = abl_model.get_embeddings(train_tensor_abl.to(config.DEVICE))
+                cl_t = torch.LongTensor(cluster_labels_abl).to(config.DEVICE)
+                abl_energy_detector.update_cluster_statistics(train_emb_t, cl_t)
+        else:
+            abl_energy_detector = None
+
+    # --- Threshold tuning on validation ---
+    best_threshold_abl, val_metrics_abl, _, val_norm_stats_abl = \
+        tune_threshold_on_validation(abl_model, abl_recon_detector, abl_energy_detector,
+                                      abl_clustering, val_data, val_gt, config)
+
+    # --- Test evaluation ---
+    test_tensor_gpu = test_tensor_abl.to(config.DEVICE)
+    with torch.no_grad():
+        recon_scores_abl, _ = abl_recon_detector.predict(test_tensor_gpu)
+        recon_scores_abl = recon_scores_abl.cpu().numpy() if torch.is_tensor(recon_scores_abl) else recon_scores_abl
+        embeddings_abl = abl_model.get_embeddings(test_tensor_gpu)
+        embeddings_np_abl = embeddings_abl.cpu().numpy()
+        test_cl_abl = abl_clustering.predict(embeddings_np_abl)
+        cluster_scores_abl = abl_clustering.compute_cluster_anomaly_scores(embeddings_np_abl, test_cl_abl)
+        energy_scores_abl = None
+        if abl_energy_detector is not None:
+            cl_t = torch.LongTensor(test_cl_abl).to(config.DEVICE)
+            es = abl_energy_detector(embeddings_abl, cluster_labels=cl_t)
+            energy_scores_abl = es.detach().cpu().numpy()
+
+    # Determine predictions using same strategy as main pipeline
+    use_or = val_norm_stats_abl.get('use_or_ensemble', False)
+    use_cascade = val_norm_stats_abl.get('use_cascade', False)
+    is_recon_only = val_norm_stats_abl.get('comp_thresholds', {}).get('recon_only', False)
+
+    if use_cascade and energy_scores_abl is not None:
+        rp5, rp95 = val_norm_stats_abl['recon_p5'], val_norm_stats_abl['recon_p95']
+        rn = np.clip((recon_scores_abl - rp5) / (rp95 - rp5 + 1e-8), 0, 1)
+        rt = np.percentile(rn, val_norm_stats_abl.get('cascade_recon_pctl', 90))
+        et = np.percentile(energy_scores_abl, val_norm_stats_abl.get('cascade_energy_pctl', 90))
+        predictions_abl = (rn > rt) | ((~(rn > rt)) & (energy_scores_abl > et))
+        final_scores_abl = rn
+    elif use_or:
+        predictions_abl = np.zeros(len(test_gt), dtype=bool)
+        comps = {'recon': recon_scores_abl, 'cluster': cluster_scores_abl}
+        if energy_scores_abl is not None:
+            comps['energy'] = energy_scores_abl
+        for name in val_norm_stats_abl.get('or_comp_names', []):
+            if name in comps and name in val_norm_stats_abl.get('or_percentiles', {}):
+                t = np.percentile(comps[name], val_norm_stats_abl['or_percentiles'][name])
+                predictions_abl |= (comps[name] > t)
+        final_scores_abl = recon_scores_abl
+    elif is_recon_only:
+        rp5, rp95 = val_norm_stats_abl['recon_p5'], val_norm_stats_abl['recon_p95']
+        rn = np.clip((recon_scores_abl - rp5) / (rp95 - rp5 + 1e-8), 0, 1)
+        predictions_abl = rn > best_threshold_abl
+        final_scores_abl = rn
+    else:
+        rp5, rp95 = val_norm_stats_abl['recon_p5'], val_norm_stats_abl['recon_p95']
+        cp5, cp95 = val_norm_stats_abl['cluster_p5'], val_norm_stats_abl['cluster_p95']
+        rn = np.clip((recon_scores_abl - rp5) / (rp95 - rp5 + 1e-8), 0, 1)
+        cn = np.clip((cluster_scores_abl - cp5) / (cp95 - cp5 + 1e-8), 0, 1)
+        if energy_scores_abl is not None:
+            ep5, ep95 = val_norm_stats_abl['energy_p5'], val_norm_stats_abl['energy_p95']
+            en = np.clip((energy_scores_abl - ep5) / (ep95 - ep5 + 1e-8), 0, 1)
+            tw = config.RECON_WEIGHT + config.CLUSTER_WEIGHT + config.ENERGY_WEIGHT
+            final_scores_abl = (config.RECON_WEIGHT/tw)*rn + (config.CLUSTER_WEIGHT/tw)*cn + (config.ENERGY_WEIGHT/tw)*en
+        else:
+            tw = config.RECON_WEIGHT + config.CLUSTER_WEIGHT
+            final_scores_abl = (config.RECON_WEIGHT/tw)*rn + (config.CLUSTER_WEIGHT/tw)*cn
+        predictions_abl = final_scores_abl > best_threshold_abl
+
+    tp = int(np.sum((predictions_abl == True) & (test_gt == True)))
+    fp = int(np.sum((predictions_abl == True) & (test_gt == False)))
+    fn = int(np.sum((predictions_abl == False) & (test_gt == True)))
+    tn = int(np.sum((predictions_abl == False) & (test_gt == False)))
+
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_val = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    from sklearn.metrics import roc_auc_score
+    try:
+        roc = float(roc_auc_score(test_gt, final_scores_abl))
+    except Exception:
+        roc = 0.0
+
+    print(f"  → {config_name}: F1={f1_val:.4f} P={prec:.4f} R={rec:.4f} AUC={roc:.4f} "
+          f"(TP={tp} FP={fp} FN={fn} TN={tn})  epochs={epochs_trained}")
+
+    return {
+        'f1': float(f1_val), 'precision': float(prec), 'recall': float(rec),
+        'roc_auc': float(roc), 'epochs_trained': int(epochs_trained),
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+        'parameters': int(n_params),
+    }
+
+
+def run_architecture_ablation(train_normal_data, train_data, train_gt,
+                               val_data, val_gt, test_data, test_gt,
+                               n_features, feature_names, config, out_dir):
+    """Run the 6-configuration architecture ablation and emit artifacts."""
+    print("\n" + "="*80)
+    print("ARCHITECTURE ABLATION (6 configurations)")
+    print("="*80)
+
+    configs = [
+        ("Base (no new blocks)",  False, False, False),
+        ("+ MSTC only",           True,  False, False),
+        ("+ HRG only",            False, True,  False),
+        ("+ Gated head only",     False, False, True),
+        ("MSTC + HRG",            True,  True,  False),
+        ("Full (proposed)",       True,  True,  True),
+    ]
+
+    ablation_results = {}
+    for name, mstc, hrg, gated in configs:
+        result = run_single_ablation_config(
+            name, mstc, hrg, gated,
+            train_normal_data, train_data, train_gt,
+            val_data, val_gt, test_data, test_gt,
+            n_features, feature_names, config)
+        ablation_results[name] = result
+
+    # --- Dual-anchor sanity check ---
+    # The ablation harness is only trustworthy if the two anchor configs
+    # reproduce the main run's numbers.  If they don't, something in the
+    # harness differs from the main pipeline and must be investigated.
+    harness_verified = True
+
+    base = ablation_results.get("Base (no new blocks)", {})
+    base_f1 = base.get('f1', 0)
+    print(f"\n  SANITY CHECK — Base config: F1={base_f1:.4f}  "
+          f"TP={base.get('tp',0)} FP={base.get('fp',0)} "
+          f"FN={base.get('fn',0)} TN={base.get('tn',0)}")
+    if abs(base_f1 - 0.748) > 0.05:
+        print(f"  ⛔ WARNING: Base F1 ({base_f1:.4f}) deviates from published 0.748 by "
+              f"{abs(base_f1 - 0.748):.4f}. Check for unintended changes.")
+        harness_verified = False
+    else:
+        print(f"  ✓ Base F1 within tolerance of published result (0.748)")
+
+    full = ablation_results.get("Full (proposed)", {})
+    full_f1 = full.get('f1', 0)
+    print(f"  SANITY CHECK — Full config: F1={full_f1:.4f}  "
+          f"TP={full.get('tp',0)} FP={full.get('fp',0)} "
+          f"FN={full.get('fn',0)} TN={full.get('tn',0)}")
+    if abs(full_f1 - 0.805) > 0.05:
+        print(f"  ⛔ WARNING: Full F1 ({full_f1:.4f}) deviates from main run 0.805 by "
+              f"{abs(full_f1 - 0.805):.4f}. Harness may still differ from main pipeline.")
+        harness_verified = False
+    else:
+        print(f"  ✓ Full F1 within tolerance of main run result (0.805)")
+
+    if not harness_verified:
+        print("  ⛔ ABLATION HARNESS VERIFICATION FAILED — results saved but flagged as unverified")
+    else:
+        print("  ✓ Both anchors verified — ablation harness is trustworthy")
+
+    # Record verification status in results
+    for name in ablation_results:
+        ablation_results[name]['harness_verified'] = harness_verified
+
+    # Save JSON
+    with open(f"{out_dir}/ablation_architecture.json", 'w') as f:
+        json.dump(ablation_results, f, indent=2)
+    print(f"\n✓ Saved ablation_architecture.json")
+
+    # --- Plot bar chart (11b) ---
+    fig_dir = f"{out_dir}/thesis_figures"
+    os.makedirs(fig_dir, exist_ok=True)
+
+    names = list(ablation_results.keys())
+    f1_vals = [ablation_results[n]['f1'] for n in names]
+    prec_vals = [ablation_results[n]['precision'] for n in names]
+    rec_vals = [ablation_results[n]['recall'] for n in names]
+    auc_vals = [ablation_results[n]['roc_auc'] for n in names]
+
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    x_pos = np.arange(len(names))
+    width = 0.2
+
+    colors_f1 = [FS.ACCENT if 'proposed' in n.lower() or 'full' in n.lower()
+                 else FS.NEUTRALS[0] for n in names]
+    bars_f1 = ax.bar(x_pos - 1.5*width, f1_vals, width, color=colors_f1,
+                     edgecolor=FS.INK, linewidth=0.5, label='F1')
+    bars_p = ax.bar(x_pos - 0.5*width, prec_vals, width, color=FS.NEUTRALS[1],
+                    edgecolor=FS.INK, linewidth=0.5, alpha=0.7, label='Precision')
+    bars_r = ax.bar(x_pos + 0.5*width, rec_vals, width, color=FS.NEUTRALS[2],
+                    edgecolor=FS.INK, linewidth=0.5, alpha=0.7, label='Recall')
+    bars_a = ax.bar(x_pos + 1.5*width, auc_vals, width, color=FS.NEUTRALS[3],
+                    edgecolor=FS.INK, linewidth=0.5, alpha=0.7, label='ROC-AUC')
+
+    for bar, val in zip(bars_f1, f1_vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.008,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([n.replace(' ', '\n') for n in names], fontsize=8.5)
+    ax.set_ylabel('Score')
+    ax.set_ylim(0, max(max(f1_vals), max(auc_vals)) * 1.15 + 0.05)
+    ax.set_title('Architecture Ablation')
+    ax.legend(fontsize=8, ncol=4)
+    fig.tight_layout()
+    FS.save(fig, f"{fig_dir}/11b_architecture_ablation")
+    print(f"✓ Saved 11b_architecture_ablation.pdf/png")
+
+    return ablation_results
 
 
 def main():
@@ -2203,10 +2966,18 @@ def main():
         dropout=ImprovedConfig.DROPOUT,
         mask_ratio=ImprovedConfig.MASK_RATIO,
         contrastive_weight=ImprovedConfig.CONTRASTIVE_WEIGHT,
-        reconstruction_weight=ImprovedConfig.RECONSTRUCTION_WEIGHT
+        reconstruction_weight=ImprovedConfig.RECONSTRUCTION_WEIGHT,
+        use_mstc=ImprovedConfig.USE_MSTC,
+        use_hrg=ImprovedConfig.USE_HRG,
     ).to(ImprovedConfig.DEVICE)
 
     print(f"✓ Model: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # Log MSTC initial dilation values
+    mstc_alpha_initial = None
+    if ImprovedConfig.USE_MSTC and model.encoder.mstc is not None:
+        mstc_alpha_initial = model.encoder.mstc.get_alphas()
+        print(f"  MSTC initial α values: {[f'{a:.4f}' for a in mstc_alpha_initial]}")
 
     # ========================================================================
     # [3] TRAIN MAIN MODEL
@@ -2445,7 +3216,8 @@ def main():
         print("\n[6/8] Training stable energy detector...")
         energy_detector = EnergyBasedAnomalyDetector(
             embedding_dim=ImprovedConfig.D_MODEL,
-            n_clusters=ImprovedConfig.N_CLUSTERS
+            n_clusters=ImprovedConfig.N_CLUSTERS,
+            use_gated_head=ImprovedConfig.USE_GATED_HEAD,
         ).to(ImprovedConfig.DEVICE)
 
         success = train_energy_detector_stable(
@@ -2708,6 +3480,28 @@ def main():
     )
 
     # ========================================================================
+    # GUIDANCE MAP FIGURE (19)
+    # ========================================================================
+    guidance_stats = {}
+    try:
+        guidance_stats = plot_guidance_map(
+            model, test_tensor, test_gt, test_anomaly_type_seq,
+            fig_dir, ImprovedConfig)
+    except Exception as e:
+        print(f"  ⚠️ Guidance map figure failed: {e}")
+
+    # ========================================================================
+    # LOG FINAL MSTC ALPHA VALUES
+    # ========================================================================
+    mstc_alpha_final = None
+    if ImprovedConfig.USE_MSTC and model.encoder.mstc is not None:
+        mstc_alpha_final = model.encoder.mstc.get_alphas()
+        print(f"\n  MSTC final α values: {[f'{a:.4f}' for a in mstc_alpha_final]}")
+        if mstc_alpha_initial is not None:
+            deltas = [f - i for f, i in zip(mstc_alpha_final, mstc_alpha_initial)]
+            print(f"  MSTC α deltas:       {[f'{d:+.4f}' for d in deltas]}")
+
+    # ========================================================================
     # SAVE figure_data.npz (B2)
     # ========================================================================
     print("\nSaving figure_data.npz...")
@@ -2760,7 +3554,24 @@ def main():
         },
         'detection_method': detection_method,
         'threshold': float(best_threshold),
+        'architecture': {
+            'USE_MSTC': ImprovedConfig.USE_MSTC,
+            'USE_HRG': ImprovedConfig.USE_HRG,
+            'USE_GATED_HEAD': ImprovedConfig.USE_GATED_HEAD,
+        },
     }
+
+    # Learned MSTC dilations
+    if mstc_alpha_initial is not None and mstc_alpha_final is not None:
+        paper_metrics['mstc_dilations'] = {
+            'initial': [float(a) for a in mstc_alpha_initial],
+            'final': [float(a) for a in mstc_alpha_final],
+            'converged_to_different_scales': len(set(round(a, 1) for a in mstc_alpha_final)) > 1,
+        }
+
+    # Guidance statistics
+    if guidance_stats:
+        paper_metrics['guidance_statistics'] = guidance_stats
 
     # Per-type detection rates
     per_type = viz_collected.get('per_type', {})
@@ -2796,8 +3607,26 @@ def main():
     # ========================================================================
     # INFERENCE PROFILING & MANIFEST
     # ========================================================================
+    # Compute base-config param count (no MSTC, no HRG) for comparison
+    base_model_tmp = SelfSupervisedTemporalModel(
+        n_features=n_features,
+        d_model=ImprovedConfig.D_MODEL,
+        n_heads=ImprovedConfig.N_HEADS,
+        n_layers=ImprovedConfig.N_LAYERS,
+        dropout=ImprovedConfig.DROPOUT,
+        mask_ratio=ImprovedConfig.MASK_RATIO,
+        use_mstc=False, use_hrg=False,
+    )
+    base_params_m = sum(p.numel() for p in base_model_tmp.parameters()) / 1e6
+    full_params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    del base_model_tmp
+
+    paper_metrics['params_base_m'] = float(base_params_m)
+    paper_metrics['params_full_m'] = float(full_params_m)
+
     try:
-        profile_inference(model, test_tensor[:16], ImprovedConfig.DEVICE, output_dir)
+        profile_inference(model, test_tensor[:16], ImprovedConfig.DEVICE,
+                         output_dir, base_params_m=base_params_m)
     except Exception as e:
         print(f"  ⚠️ Inference profiling failed: {e}")
         
@@ -2810,6 +3639,8 @@ def main():
             "9_roc_curve", "5_precision_recall_curve",
             "12_per_type_detection",
             "11_ablation_study",
+            "11b_architecture_ablation",
+            "19_guidance_map",
             "8_tsne_embeddings",
             "16_attention_heatmap",
             "10_component_scores"
@@ -2829,6 +3660,36 @@ def main():
     with open(f"{output_dir}/figure_manifest.json", 'w') as f:
         json.dump(manifest, f, indent=2)
     print(f"✓ Saved figure_manifest.json")
+
+    # ========================================================================
+    # ARCHITECTURE ABLATION (6 configs)
+    # ========================================================================
+    if ImprovedConfig.RUN_ABLATION:
+        try:
+            ablation_arch_results = run_architecture_ablation(
+                train_normal_data=train_data[~train_gt.astype(bool)],
+                train_data=train_data,
+                train_gt=train_gt,
+                val_data=val_data,
+                val_gt=val_gt,
+                test_data=test_data,
+                test_gt=test_gt,
+                n_features=n_features,
+                feature_names=feature_names,
+                config=ImprovedConfig,
+                out_dir=output_dir,
+            )
+            # Merge architecture ablation into paper_metrics
+            paper_metrics['architecture_ablation'] = ablation_arch_results
+            with open(f"{output_dir}/paper_metrics.json", 'w') as f:
+                json.dump(paper_metrics, f, indent=2)
+            print("✓ Updated paper_metrics.json with architecture ablation results")
+        except Exception as e:
+            print(f"  ⚠️ Architecture ablation failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("\n  ⚠️ Skipping Architecture Ablation (RUN_ABLATION=False)")
 
     # ========================================================================
     # FINAL SUMMARY TABLE
@@ -2851,15 +3712,39 @@ def main():
         for t, v in paper_metrics['per_type_detection'].items():
             print(f"    {t:<25s}  {v['rate']:.1%}  (detected {v['detected']}/{v['total']})")
 
-    if paper_metrics['ablation_f1']:
+    if paper_metrics.get('ablation_f1'):
         print(f"\n  Ablation F1 Scores:")
         for config_name, f1_val in paper_metrics['ablation_f1'].items():
             print(f"    {config_name:<25s}  {f1_val:.3f}")
 
-    if paper_metrics['dprime']:
+    if paper_metrics.get('dprime'):
         print(f"\n  Corrected d' (pooled-variance):")
         for comp, dp in paper_metrics['dprime'].items():
             print(f"    {comp:<20s}  {FS.d_prime_label(dp)}")
+
+    if paper_metrics.get('mstc_dilations'):
+        d = paper_metrics['mstc_dilations']
+        print(f"\n  MSTC Learned Dilations:")
+        print(f"    Initial: {d['initial']}")
+        print(f"    Final:   {d['final']}")
+        print(f"    Converged to different scales: {d['converged_to_different_scales']}")
+
+    if paper_metrics.get('guidance_statistics'):
+        gs = paper_metrics['guidance_statistics']
+        print(f"\n  Guidance Map Statistics (position-controlled):")
+        print(f"    g at anomaly position (57-59):")
+        print(f"      Anomaly windows: {gs.get('mean_g_5759_anomaly', 0):.4f}")
+        print(f"      Normal windows:  {gs.get('mean_g_5759_normal', 0):.4f}")
+        print(f"      Delta:           {gs.get('g_5759_delta', 0):+.4f}")
+        print(f"    g at mid-window (28-30, control):")
+        print(f"      Anomaly windows: {gs.get('mean_g_mid_anomaly', 0):.4f}")
+        print(f"      Normal windows:  {gs.get('mean_g_mid_normal', 0):.4f}")
+        print(f"      Delta:           {gs.get('g_mid_delta', 0):+.4f}")
+
+    if paper_metrics.get('params_base_m'):
+        print(f"\n  Parameter Counts:")
+        print(f"    Base (no new blocks): {paper_metrics['params_base_m']:.3f}M")
+        print(f"    Full (proposed):      {paper_metrics['params_full_m']:.3f}M")
 
     print(f"\n  Detection Method: {detection_method}")
     print("="*80)

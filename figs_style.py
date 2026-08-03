@@ -25,6 +25,9 @@ ACCENT_L = "#F4C89B"     # light amber — shading behind accent
 GOOD = "#2E7D5B"         # green  — positive outcome
 BAD = "#B4483C"          # red    — negative outcome / anomaly class
 
+BG = "#FFFFFF"            # background
+NEUTRAL = "#D1D5DB"       # light grey — TN / background class
+
 NEUTRALS = ["#4C6E8A", "#7FA3B8", "#B7C9D6", "#9AA5B1", "#C3CAD3"]
 
 SEQ_BLUE = ["#F2F7FB", "#D8E7F1", "#A9CCE3", "#6FA8C9", "#2A6F97"]

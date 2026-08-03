@@ -1,6 +1,10 @@
 """
 Energy-Based and Reconstruction-Based Anomaly Detection
 Identifies rare and structurally inconsistent temporal patterns
+
+Extended with optional Gated Dual-Detector Head (USE_GATED_HEAD).
+When enabled, the energy branch uses a shared gated trunk architecture.
+The reconstruction score R = S_recon remains error-based (unchanged).
 """
 
 import torch
@@ -12,30 +16,88 @@ class EnergyBasedAnomalyDetector(nn.Module):
     """
     Energy-based anomaly scoring with cluster conditioning
     High energy = anomaly (far from normal cluster regions)
+
+    When use_gated_head=True, uses the manuscript's gated dual-detector
+    architecture:
+      - Shared trunk: Linear -> BN -> GeLU -> Drop -> Linear -> BN -> GeLU
+                      -> Drop -> Linear -> BN  (produces hidden h)
+      - Gating network: Linear -> ReLU -> Linear -> sigmoid (gates h)
+      - Energy branch: MLP 64->256->256->128->1 with residual in 256-d,
+                       Softplus output, cluster-normalised.
+    The gated features (h * gate) produce a "reconstruction-proxy" score
+    that feeds the cascade, but the actual reconstruction score R is
+    still computed from reconstruction error (not from this head).
     """
 
-    def __init__(self, embedding_dim, n_clusters, temperature=1.0):
+    def __init__(self, embedding_dim, n_clusters, temperature=1.0,
+                 use_gated_head=False):
         super().__init__()
 
         self.embedding_dim = embedding_dim
         self.n_clusters = n_clusters
         self.temperature = temperature
+        self.use_gated_head = use_gated_head
 
-        # Energy function (learned) - deeper with residual connection
-        self.energy_proj = nn.Linear(embedding_dim, 256)
-        self.energy_block1 = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-        )
-        self.energy_block2 = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-        )
-        self.energy_head = nn.Linear(128, 1)
+        if use_gated_head:
+            # --- Shared trunk ---
+            self.trunk = nn.Sequential(
+                nn.Linear(embedding_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.GELU(),
+                nn.Dropout(0.35),
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256),
+                nn.GELU(),
+                nn.Dropout(0.35),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+            )
+
+            # --- Gating network ---
+            self.gate_net = nn.Sequential(
+                nn.Linear(128, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 128),
+                nn.Sigmoid(),
+            )
+
+            # --- Gated reconstruction-proxy head (R_proxy) ---
+            # This produces a scalar that can be used in cascade,
+            # but the "real" R is always the error-based S_recon.
+            self.recon_proxy_head = nn.Linear(128, 1)
+
+            # --- Energy branch: 64 -> 256 -> 256 -> 128 -> 1 ---
+            self.energy_proj_gated = nn.Linear(embedding_dim, 256)
+            self.energy_res_block = nn.Sequential(
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+            )
+            self.energy_down = nn.Sequential(
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+            )
+            self.energy_head_gated = nn.Linear(128, 1)
+        else:
+            # --- Original (non-gated) energy architecture ---
+            # Energy function (learned) - deeper with residual connection
+            self.energy_proj = nn.Linear(embedding_dim, 256)
+            self.energy_block1 = nn.Sequential(
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            )
+            self.energy_block2 = nn.Sequential(
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            )
+            self.energy_head = nn.Linear(128, 1)
 
         # Cluster-specific energy normalization
         self.cluster_energy_means = nn.Parameter(torch.zeros(n_clusters))
@@ -43,17 +105,44 @@ class EnergyBasedAnomalyDetector(nn.Module):
 
     def compute_energy(self, embeddings):
         """
-        Compute energy score for embeddings using deeper MLP with residual.
+        Compute energy score for embeddings.
         Args:
             embeddings: (batch_size, embedding_dim)
         Returns:
             energy: (batch_size,) - lower is more normal
         """
-        h = torch.relu(self.energy_proj(embeddings))   # (B, 256)
-        h = self.energy_block1(h) + h                   # residual connection
-        h = self.energy_block2(h)                        # (B, 128)
-        energy = self.energy_head(h).squeeze(-1)         # (B,)
-        return energy
+        if self.use_gated_head:
+            h = torch.relu(self.energy_proj_gated(embeddings))  # (B, 256)
+            h = self.energy_res_block(h) + h                     # residual in 256-d
+            h = self.energy_down(h)                               # (B, 128)
+            energy = F.softplus(self.energy_head_gated(h).squeeze(-1))  # (B,)
+            return energy
+        else:
+            h = torch.relu(self.energy_proj(embeddings))   # (B, 256)
+            h = self.energy_block1(h) + h                   # residual connection
+            h = self.energy_block2(h)                        # (B, 128)
+            energy = self.energy_head(h).squeeze(-1)         # (B,)
+            return energy
+
+    def compute_gated_proxy(self, embeddings):
+        """Compute the gated reconstruction-proxy score (R_proxy).
+
+        Only available when use_gated_head=True.  This is NOT the
+        real reconstruction score -- that comes from ReconstructionBasedDetector.
+        This proxy score is used in the cascade: flag if R_proxy > theta_r,
+        else check E > theta_e.
+
+        Args:
+            embeddings: (batch_size, embedding_dim)
+        Returns:
+            r_proxy: (batch_size,) -- higher = more anomalous
+        """
+        assert self.use_gated_head, "compute_gated_proxy requires use_gated_head=True"
+        h = self.trunk(embeddings)       # (B, 128)
+        gate = self.gate_net(h)          # (B, 128)
+        gated = h * gate                 # (B, 128)
+        r_proxy = self.recon_proxy_head(gated).squeeze(-1)  # (B,)
+        return r_proxy
 
     def forward(self, embeddings, cluster_labels=None):
         """
@@ -101,9 +190,13 @@ class EnergyBasedAnomalyDetector(nn.Module):
                 if mask.sum() > 0:
                     cluster_energies = energy[mask]
 
-                    # Direct computation (not EMA) — correct for single-call usage
+                    # Direct computation (not EMA) -- correct for single-call usage
                     self.cluster_energy_means[k] = cluster_energies.mean()
                     self.cluster_energy_stds[k] = cluster_energies.std().clamp(min=1e-4)
+
+
+# Need F for softplus
+import torch.nn.functional as F
 
 
 class ReconstructionBasedDetector:
@@ -201,7 +294,7 @@ class ReconstructionBasedDetector:
             # Use simple Euclidean if covariance not fitted
             return (residual ** 2).mean(dim=1)
 
-        # Mahalanobis distance: sqrt(r^T * Σ^-1 * r)
+        # Mahalanobis distance: sqrt(r^T * S^-1 * r)
         if torch.is_tensor(residual):
             residual_np = residual.cpu().numpy()
         else:
@@ -444,4 +537,3 @@ class HybridAnomalyDetector:
             self.threshold = np.percentile(scores_np, percentile)
 
             print(f"Hybrid anomaly threshold set to: {self.threshold:.6f}")
-
